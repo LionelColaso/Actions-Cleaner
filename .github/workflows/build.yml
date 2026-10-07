@@ -1,0 +1,124 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      attest:
+        description: "Generate build attestations"
+        required: false
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      attest:
+        description: "Generate build attestations"
+        required: false
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.14"
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ${{ matrix.os }}-nuitka
+          max-size: 1.0G
+
+      - name: Install Linux Qt runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libglx-mesa0 libglib2.0-0 libxkbcommon0 libxkbcommon-x11-0 libxcb-cursor0
+        shell: bash
+
+      - name: Install coreutils (for timeout) on macOS
+        if: runner.os == 'macOS'
+        run: brew install coreutils
+        shell: bash
+
+      - name: Sync dependencies (build group, no dev)
+        run: uv sync --locked --no-dev --group build
+
+      - name: Build
+        run: uv run --no-dev --group build python scripts/build.py --product-version "0.0.0.0"
+        env:
+          CCACHE_MAXSIZE: "1.0G"
+
+      - name: Find Executable
+        id: find_executable
+        shell: bash
+        run: |
+          exe=$(find build \( -name "actions-cleaner" -o -name "actions-cleaner.exe" \) -type f | head -n 1)
+          if [ -z "$exe" ]; then
+            echo "built executable not found under build/" >&2
+            exit 1
+          fi
+          case "$exe" in
+            *actions-cleaner.app/Contents/MacOS/actions-cleaner)
+              artifact=$(dirname "$(dirname "$(dirname "$exe")")")
+              ;;
+            *)
+              artifact=$(dirname "$exe")
+              ;;
+          esac
+          echo "EXECUTABLE=$exe" >> "$GITHUB_OUTPUT"
+          echo "ARTIFACT=$artifact" >> "$GITHUB_OUTPUT"
+          echo "Executable: $exe"
+          echo "Artifact:   $artifact"
+
+      - name: Launch smoke test (built executable runs)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            export QT_QPA_PLATFORM=offscreen
+          fi
+          EXE="${{ steps.find_executable.outputs.EXECUTABLE }}"
+          echo "Testing executable: $EXE"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            timeout 10 "$EXE" || EXIT_CODE=$?
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            gtimeout 10 "$EXE" || EXIT_CODE=$?
+          else
+            timeout 10 "$EXE" || EXIT_CODE=$?
+          fi
+          if [ "${EXIT_CODE:-0}" = "124" ]; then
+            echo "Executable launched successfully (timed out as expected)"
+          elif [ "${EXIT_CODE:-0}" = "0" ]; then
+            echo "Executable ran and exited cleanly"
+          else
+            echo "Executable failed with exit code ${EXIT_CODE:-0}"
+            exit "${EXIT_CODE:-1}"
+          fi
+
+      - name: Generate build attestation
+        uses: actions/attest-build-provenance@v4
+        if: ${{ inputs.attest }}
+        with:
+          subject-path: ${{ steps.find_executable.outputs.ARTIFACT }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: actions-cleaner-${{ matrix.os }}
+          path: ${{ steps.find_executable.outputs.ARTIFACT }}
+          if-no-files-found: warn

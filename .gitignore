@@ -1,0 +1,64 @@
+# Python bytecode / packaging
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+junit/
+junit.xml
+
+# Type checkers
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vs/
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+.ropeproject/
+.kilo/
+
+# Nuitka / build
+*.build/
+*.dist/
+*.onefile-build/
+nuitka-crash-report.xml
+build_err.log
+build_local.log
+
+# CocoIndex Code (ccc)
+.cocoindex_code/
+
+# Dictionaries
+ltex.dictionary*
+
+# Translation cache
+.translation_cache.json
+
+# GitHub Actions local test artifacts
+DEBUG
+
+# OS
+.DS_Store

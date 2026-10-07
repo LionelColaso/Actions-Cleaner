@@ -1,0 +1,17 @@
+{
+  "threshold": 0,
+  "ignore": [
+    "**/.venv/**",
+    "**/.git/**",
+    "**/.github/**",
+    "**/build/**",
+    "**/dist/**",
+    "**/*.lock",
+    "**/resources/**",
+    "**/vendor/**",
+    "**/*.md",
+    "**/docs/**",
+    "coverage.xml",
+    ".coverage"
+  ]
+}

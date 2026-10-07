@@ -1,0 +1,137 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      type:
+        description: "Release type"
+        required: true
+        type: choice
+        options:
+          - "Stable"
+          - "Edge"
+        default: "Edge"
+      draft:
+        description: "Draft release (do not publish)"
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build
+    uses: ./.github/workflows/build.yml
+    with:
+      attest: true
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: success()
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+
+      - name: Determine tag, version and type
+        id: meta
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          type="${{ github.event.inputs.type }}"
+          echo "type=$type" >> "$GITHUB_OUTPUT"
+          if [[ "$type" == "Stable" ]]; then
+            tag="v$version"
+            prerelease=false
+          elif [[ "$type" == "Edge" ]]; then
+            tag="Edge"
+            prerelease=true
+          else
+            echo "Unknown type: $type" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8.0.1
+        with:
+          path: artifacts
+
+      - name: Package artifacts
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os, zipfile, shutil
+
+          root = "artifacts"
+          version = os.environ["VERSION"]
+          platform_map = {
+              "ubuntu-latest": "linux",
+              "windows-latest": "windows",
+              "macos-latest": "macos",
+          }
+          for name in sorted(os.listdir(root)):
+              src = os.path.join(root, name)
+              if not os.path.isdir(src) or not name.startswith("actions-cleaner-"):
+                  continue
+              base = name.replace("actions-cleaner-", "", 1).removesuffix("-latest")
+              dist_name = platform_map.get(base, base)
+              zip_path = os.path.join(root, f"actions-cleaner-{version}-{dist_name}.zip")
+              with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                  for top, _dirs, files in os.walk(src):
+                      for f in files:
+                          full = os.path.join(top, f)
+                          zf.write(full, os.path.relpath(full, src))
+              print(f"packaged {name} -> {os.path.basename(zip_path)}")
+              shutil.rmtree(src)
+          PY
+
+      - name: Create body
+        id: body
+        shell: bash
+        run: |
+          ACTION_RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [[ "${{ steps.meta.outputs.type }}" == "Edge" ]]; then
+            warning="> **⚠️ This is an unstable edge build from the latest main branch. It may contain bugs and breaking changes. Use stable releases for production.**"
+          else
+            warning=""
+          fi
+          message="${{ steps.meta.outputs.type }} release ${{ steps.meta.outputs.version }}.
+          Built from commit ${{ github.sha }}.
+
+          ${warning}
+
+          Refer to the [action run]($ACTION_RUN_URL) that created this release."
+          echo "body<<EOF"$'\n'"$message"$'\n'EOF >> "$GITHUB_OUTPUT"
+
+      - name: Delete previous Edge release and tag
+        if: ${{ steps.meta.outputs.type == 'Edge' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete Edge -y --cleanup-tag || echo "No previous release with tag Edge found"
+          git tag -d Edge || echo "Edge tag doesn't exist locally"
+
+      - name: Create release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd
+        with:
+          artifacts: "artifacts/*.zip"
+          tag: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.type == 'Edge' && 'Edge Build (Unstable)' || steps.meta.outputs.tag }}
+          generateReleaseNotes: true
+          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
+          draft: ${{ github.event.inputs.draft }}
+          body: ${{ steps.body.outputs.body }}
+          allowUpdates: true
+          removeArtifacts: true
+          commit: ${{ github.sha }}
