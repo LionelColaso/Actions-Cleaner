@@ -26,9 +26,9 @@ def _build_nuitka_command(product_version: str = "", dev: bool = False) -> list[
         "nuitka",
         "--standalone",
         "--output-filename=actions-cleaner",
-        "--python-flag=-m",  # documented Nuitka flag (run as module)
         "--enable-plugin=pyside6",
         "--include-qt-plugins=platforms,imageformats,iconengines,tls",
+        f"--include-data-dir={ROOT / 'assets'}=assets",
         "--assume-yes-for-downloads",
         "--static-libpython=auto",
         "--nofollow-import-to=mypy",
