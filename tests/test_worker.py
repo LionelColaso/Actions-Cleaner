@@ -53,7 +53,7 @@ class _GhMock:
             repo: str,
             fetch_limit: int = 0,
             workflow: str = "",
-            timeout: int = 60,
+            timeout: int = app.TIMEOUT_LIST_DEFAULT,
         ) -> list[app.RunInfo]:
             self.list_timeout_seen = timeout
             if self.list_error is not None:
@@ -62,7 +62,9 @@ class _GhMock:
             self.list_workflow = workflow
             return list(self.runs)
 
-        def fake_delete(repo: str, run_id: str, timeout: int = 60) -> tuple[bool, str]:
+        def fake_delete(
+            repo: str, run_id: str, timeout: int = app.TIMEOUT_DELETE_DEFAULT
+        ) -> tuple[bool, str]:
             self.delete_timeout_seen = timeout
             if self.delete_error is not None:
                 raise self.delete_error
@@ -386,7 +388,9 @@ def test_concurrency_reports_failed_ids_by_name(
     # Override the mock's delete after install so the worker uses flaky_delete.
     original_delete = app.delete_run
 
-    def flaky_delete(repo: str, run_id: str, timeout: int = 60) -> tuple[bool, str]:
+    def flaky_delete(
+        repo: str, run_id: str, timeout: int = app.TIMEOUT_DELETE_DEFAULT
+    ) -> tuple[bool, str]:
         if run_id == "1":
             return False, "boom"
         return original_delete(repo, run_id, timeout)

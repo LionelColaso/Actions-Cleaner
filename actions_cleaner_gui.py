@@ -60,24 +60,24 @@ PREFERENCES_PATH = os.path.join(
 )
 
 GH_LIST_TIMEOUT = 60  # seconds for `gh run list`
-GH_DELETE_TIMEOUT = 60  # seconds per `gh run delete`
-GH_AUTH_TIMEOUT = 30  # seconds for `gh auth status`
+GH_DELETE_TIMEOUT = 30  # seconds per `gh run delete`
+GH_AUTH_TIMEOUT = 15  # seconds for `gh auth status` (fail fast)
 #: Bounds for the user-configurable timeouts (seconds).
-TIMEOUT_MIN = 5
-TIMEOUT_MAX = 600
-TIMEOUT_LIST_DEFAULT = 60
-TIMEOUT_DELETE_DEFAULT = 60
-TIMEOUT_AUTH_DEFAULT = 30
+TIMEOUT_MIN = 10  # allows lower defaults like auth=15
+TIMEOUT_MAX = 180  # generous upper bound for slow networks
+TIMEOUT_LIST_DEFAULT = 60  # reasonable for potentially large run lists
+TIMEOUT_DELETE_DEFAULT = 30  # match GH_DELETE_TIMEOUT — delete is fast
+TIMEOUT_AUTH_DEFAULT = 15  # MUST be low for fast auth failure detection
 
 #: Granularity of one `gh run list` page; total fetch capped by `fetch_limit`.
 GH_PAGE_SIZE = 100
 #: Bounds for the user-configurable fetch limit (runs fetched per cleanup).
 FETCH_LIMIT_MIN = 100
-FETCH_LIMIT_MAX = 10000
+FETCH_LIMIT_MAX = 3000
 FETCH_LIMIT_DEFAULT = 1000
 #: Bounds for the user-configurable per-run deletion cap (0 = unlimited).
 MAX_DELETIONS_MIN = 0
-MAX_DELETIONS_MAX = 10000
+MAX_DELETIONS_MAX = 5000
 #: Bounds for the user-configurable deletion concurrency (1 = sequential).
 CONCURRENCY_MIN = 1
 CONCURRENCY_MAX = 10
