@@ -203,9 +203,7 @@ def test_preferences_roundtrip_with_concurrency(
 def test_preferences_roundtrip_with_timeouts(
     settings_paths: tuple[Path, Path],
 ) -> None:
-    assert app.save_preferences(
-        7, True, 500, 25, "owner/repo", 8, 120, 90, 45
-    )
+    assert app.save_preferences(7, True, 500, 25, "owner/repo", 8, 120, 90, 45)
     assert app.load_preferences() == (7, True, 500, 25, "owner/repo", 8, 120, 90, 45)
 
 

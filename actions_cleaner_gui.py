@@ -381,7 +381,9 @@ def save_preferences(
         return False
 
 
-def delete_run(repo: str, run_id: str, timeout: int = GH_DELETE_TIMEOUT) -> tuple[bool, str]:
+def delete_run(
+    repo: str, run_id: str, timeout: int = GH_DELETE_TIMEOUT
+) -> tuple[bool, str]:
     """Delete a single workflow run. Returns ``(success, error detail)``."""
     try:
         result = subprocess.run(
@@ -584,9 +586,7 @@ class CleanupWorker(QThread):
                 else:
                     failed += 1
                     failed_ids.append(run_id)
-                    self.log_signal.emit(
-                        f"  Failed to delete run {run_id}: {detail}"
-                    )
+                    self.log_signal.emit(f"  Failed to delete run {run_id}: {detail}")
                 self.progress_signal.emit(done)
         else:
             # Parallel path: split delete_ids into batches of `concurrency`,
@@ -629,8 +629,7 @@ class CleanupWorker(QThread):
             return
         if failed:
             self.log_signal.emit(
-                f"Cleanup finished with {failed} failure(s): "
-                f"{', '.join(failed_ids)}"
+                f"Cleanup finished with {failed} failure(s): {', '.join(failed_ids)}"
             )
             self.finished_signal.emit(1)
             return
@@ -823,9 +822,7 @@ class MainWindow(QWidget):
         self.list_timeout_spin.setRange(TIMEOUT_MIN, TIMEOUT_MAX)
         self.list_timeout_spin.setValue(TIMEOUT_LIST_DEFAULT)
         self.list_timeout_spin.setSingleStep(10)
-        self.list_timeout_spin.setToolTip(
-            "Seconds before `gh run list` is cancelled"
-        )
+        self.list_timeout_spin.setToolTip("Seconds before `gh run list` is cancelled")
         advanced_layout.addRow("List timeout (s):", self.list_timeout_spin)
 
         self.delete_timeout_spin = QSpinBox()

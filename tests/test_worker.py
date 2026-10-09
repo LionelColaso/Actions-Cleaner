@@ -62,9 +62,7 @@ class _GhMock:
             self.list_workflow = workflow
             return list(self.runs)
 
-        def fake_delete(
-            repo: str, run_id: str, timeout: int = 60
-        ) -> tuple[bool, str]:
+        def fake_delete(repo: str, run_id: str, timeout: int = 60) -> tuple[bool, str]:
             self.delete_timeout_seen = timeout
             if self.delete_error is not None:
                 raise self.delete_error
@@ -321,9 +319,7 @@ def test_concurrency_one_is_sequential(
     gh.runs = _sample_runs(make_run)
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker(
-        "owner/repo", keep=1, dry_run=False, concurrency=1
-    )
+    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, concurrency=1)
     result = _run_worker(worker)
 
     assert gh.delete_calls == ["3"]
@@ -344,9 +340,7 @@ def test_concurrency_parallel_deletes_all(
     ]
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker(
-        "owner/repo", keep=1, dry_run=False, concurrency=4
-    )
+    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, concurrency=4)
     result = _run_worker(worker)
 
     assert set(gh.delete_calls) == {"1", "2", "3"}
@@ -376,29 +370,22 @@ def test_concurrency_reports_failed_ids_by_name(
 
     monkeypatch.setattr(app, "delete_run", flaky_delete)
 
-    worker = app.CleanupWorker(
-        "owner/repo", keep=1, dry_run=False, concurrency=3
-    )
+    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, concurrency=3)
     result = _run_worker(worker)
 
     assert result.finished == [1]
     assert any("run 1" in line and "boom" in line for line in result.logs)
     assert any(
-        line.startswith("Cleanup finished with 1 failure(s):")
-        and "1" in line
+        line.startswith("Cleanup finished with 1 failure(s):") and "1" in line
         for line in result.logs
     )
 
 
 def test_concurrency_clamped_to_bounds() -> None:
-    worker = app.CleanupWorker(
-        "owner/repo", keep=1, dry_run=True, concurrency=0
-    )
+    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True, concurrency=0)
     assert worker.concurrency == app.CONCURRENCY_MIN
 
-    worker = app.CleanupWorker(
-        "owner/repo", keep=1, dry_run=True, concurrency=99
-    )
+    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True, concurrency=99)
     assert worker.concurrency == app.CONCURRENCY_MAX
 
 
