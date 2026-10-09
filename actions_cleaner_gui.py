@@ -851,6 +851,10 @@ class MainWindow(QWidget):
 
         advanced.setLayout(advanced_layout)
 
+        self.reset_btn = QPushButton("Reset to Default")
+        self.reset_btn.clicked.connect(self.reset_defaults)
+        self.reset_btn.setToolTip("Restore all settings to default values")
+
         self.cleanup_btn = QPushButton("Clean Up Actions")
         self.cleanup_btn.clicked.connect(self.start_cleanup)
 
@@ -876,6 +880,7 @@ class MainWindow(QWidget):
         layout.addWidget(form)
         layout.addWidget(advanced)
         button_row = QHBoxLayout()
+        button_row.addWidget(self.reset_btn)
         button_row.addWidget(self.cleanup_btn)
         button_row.addWidget(self.cancel_btn)
         button_row.addWidget(self.pause_btn)
@@ -1036,6 +1041,18 @@ class MainWindow(QWidget):
         self.log_output.appendPlainText(
             "Paused — click Resume to continue." if pausing else "Resuming..."
         )
+
+    def reset_defaults(self) -> None:
+        """Reset all configurable settings to their default values."""
+        # Reset spin boxes and checkboxes to defaults
+        self.keep_spin.setValue(2)
+        self.fetch_limit_spin.setValue(FETCH_LIMIT_DEFAULT)
+        self.max_deletions_spin.setValue(MAX_DELETIONS_MIN)
+        self.concurrency_spin.setValue(CONCURRENCY_DEFAULT)
+        self.list_timeout_spin.setValue(TIMEOUT_LIST_DEFAULT)
+        self.delete_timeout_spin.setValue(TIMEOUT_DELETE_DEFAULT)
+        self.auth_timeout_spin.setValue(TIMEOUT_AUTH_DEFAULT)
+        self.failed_only_check.setChecked(False)
 
     def on_summary(self, kept: int, deleted: int, failed: int) -> None:
         self._last_summary = (kept, deleted, failed)
