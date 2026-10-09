@@ -33,11 +33,12 @@ uv run python actions_cleaner_gui.py
 
 1. Add a repository — `owner/repo` **or** a full GitHub URL (e.g. `https://github.com/owner/repo`; URLs are reduced to `owner/repo`) — and click **Add**.
 2. Set **Commits to keep** (how many recent commits to preserve).
-3. Optionally check **Failed / cancelled only** to target unsuccessful runs exclusively.
-4. Ensure **Dry run** is checked for a preview, then click **Clean Up Actions**.
-5. Uncheck **Dry run** when ready to delete.
+3. Optionally set **Runs to fetch** (how many recent runs to scan; default 1000 — `gh` paginates automatically) and **Max deletions** (cap the number deleted in one pass; `No limit` by default).
+4. Optionally check **Failed / cancelled only** to target unsuccessful runs exclusively.
+5. Ensure **Dry run** is checked for a preview, then click **Clean Up Actions**.
+6. Uncheck **Dry run** when ready to delete.
 
-Only the **1000 most recent runs** per repository are scanned (`gh run list --limit 1000`), ordered by creation date. Use **Cancel** to stop a running cleanup; closing the window mid-run waits for the current `gh` call to finish before quitting.
+Only the **most recent runs** per repository are scanned (`gh run list --limit N`, `N` = *Runs to fetch*, default 1000), ordered by creation date. While a cleanup runs you can **Pause**/resume it or **Cancel**; closing the window mid-run waits for the current `gh` call to finish before quitting.
 
 ## Build
 

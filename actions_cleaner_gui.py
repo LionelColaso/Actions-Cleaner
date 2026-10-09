@@ -10,7 +10,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from pathlib import Path
 from typing import Any, TypedDict, cast
 
 from PySide6.QtCore import QObject, QRect, Qt, QThread, Signal
@@ -61,6 +63,16 @@ GH_LIST_TIMEOUT = 60  # seconds for `gh run list`
 GH_DELETE_TIMEOUT = 60  # seconds per `gh run delete`
 GH_AUTH_TIMEOUT = 30  # seconds for `gh auth status`
 
+#: Granularity of one `gh run list` page; total fetch capped by `fetch_limit`.
+GH_PAGE_SIZE = 100
+#: Bounds for the user-configurable fetch limit (runs fetched per cleanup).
+FETCH_LIMIT_MIN = 100
+FETCH_LIMIT_MAX = 10000
+FETCH_LIMIT_DEFAULT = 1000
+#: Bounds for the user-configurable per-run deletion cap (0 = unlimited).
+MAX_DELETIONS_MIN = 0
+MAX_DELETIONS_MAX = 10000
+
 DRY_RUN_PROGRESS_STEP = 25  # throttle progress signals during dry runs
 LOG_MAX_BLOCKS = 5000  # cap on the log widget's line count
 
@@ -108,8 +120,14 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
-def list_runs(repo: str) -> list[RunInfo]:
-    """Fetch the most recent workflow runs for `repo`."""
+def list_runs(repo: str, fetch_limit: int = FETCH_LIMIT_DEFAULT) -> list[RunInfo]:
+    """Fetch up to `fetch_limit` most-recent workflow runs for `repo`.
+
+    ``gh run list --limit N`` means "maximum number of runs to fetch" and
+    pages the REST API internally (100 runs/page), so raising the limit needs
+    no manual pagination code on our side.
+    """
+    limit = max(FETCH_LIMIT_MIN, min(fetch_limit, FETCH_LIMIT_MAX))
     cmd = [
         "gh",
         "run",
@@ -117,7 +135,7 @@ def list_runs(repo: str) -> list[RunInfo]:
         "--repo",
         repo,
         "--limit",
-        "1000",
+        str(limit),
         "--json",
         "databaseId,headSha,createdAt,conclusion",
     ]
@@ -215,15 +233,17 @@ def save_repos(repos: list[str]) -> bool:
         return False
 
 
-def load_preferences() -> tuple[int, bool]:
-    """Return ``(keep, failed_only)`` with safe defaults."""
+def load_preferences() -> tuple[int, bool, int, int]:
+    """Return ``(keep, failed_only, fetch_limit, max_deletions)`` safely."""
     keep = 2
     failed_only = False
+    fetch_limit = FETCH_LIMIT_DEFAULT
+    max_deletions = MAX_DELETIONS_MIN
     try:
         with open(PREFERENCES_PATH, encoding="utf-8") as f:
             data: Any = json.load(f)
     except OSError, json.JSONDecodeError:
-        return keep, failed_only
+        return keep, failed_only, fetch_limit, max_deletions
     obj = _as_dict(data)
     raw_keep = obj.get("keep")
     if (
@@ -235,14 +255,42 @@ def load_preferences() -> tuple[int, bool]:
     failed_candidate = obj.get("failed_only")
     if isinstance(failed_candidate, bool):
         failed_only = failed_candidate
-    return keep, failed_only
+    raw_limit = obj.get("fetch_limit")
+    if (
+        isinstance(raw_limit, int)
+        and not isinstance(raw_limit, bool)
+        and FETCH_LIMIT_MIN <= raw_limit <= FETCH_LIMIT_MAX
+    ):
+        fetch_limit = raw_limit
+    raw_max_del = obj.get("max_deletions")
+    if (
+        isinstance(raw_max_del, int)
+        and not isinstance(raw_max_del, bool)
+        and MAX_DELETIONS_MIN <= raw_max_del <= MAX_DELETIONS_MAX
+    ):
+        max_deletions = raw_max_del
+    return keep, failed_only, fetch_limit, max_deletions
 
 
-def save_preferences(keep: int, failed_only: bool) -> bool:
+def save_preferences(
+    keep: int,
+    failed_only: bool,
+    fetch_limit: int = FETCH_LIMIT_DEFAULT,
+    max_deletions: int = MAX_DELETIONS_MIN,
+) -> bool:
     """Persist preferences (never dry-run — see AGENTS.md §4.3)."""
     try:
         with open(PREFERENCES_PATH, "w", encoding="utf-8") as f:
-            json.dump({"keep": keep, "failed_only": failed_only}, f, indent=2)
+            json.dump(
+                {
+                    "keep": keep,
+                    "failed_only": failed_only,
+                    "fetch_limit": fetch_limit,
+                    "max_deletions": max_deletions,
+                },
+                f,
+                indent=2,
+            )
         return True
     except OSError:
         return False
@@ -309,6 +357,8 @@ class CleanupWorker(QThread):
         keep: int,
         dry_run: bool,
         failed_only: bool = False,
+        fetch_limit: int = FETCH_LIMIT_DEFAULT,
+        max_deletions: int = MAX_DELETIONS_MIN,
         parent: QObject | None = None,
     ):
         super().__init__(parent)
@@ -316,11 +366,38 @@ class CleanupWorker(QThread):
         self.keep = keep
         self.dry_run = dry_run
         self.failed_only = failed_only
+        self.fetch_limit = max(FETCH_LIMIT_MIN, min(fetch_limit, FETCH_LIMIT_MAX))
+        # 0 (or negative) means "no cap".
+        self.max_deletions = max(0, max_deletions)
         self._cancelled = False
+        self._pause_gate = threading.Event()
+        self._pause_gate.set()  # set == running, cleared == paused
+        self._paused = False
 
     def cancel(self) -> None:
-        """Request a stop; takes effect after the current `gh` call."""
+        """Request a stop; releases the gate so a paused run() wakes up."""
         self._cancelled = True
+        self._pause_gate.set()
+
+    def set_paused(self, paused: bool) -> None:
+        """Pause (True) or resume (False) the worker between `gh` calls."""
+        self._paused = paused
+        if paused:
+            self._pause_gate.clear()
+        else:
+            self._pause_gate.set()
+
+    @property
+    def paused(self) -> bool:
+        """Whether the worker is currently paused."""
+        return self._paused
+
+    def _wait_if_paused(self) -> bool:
+        """Block while paused; return False when cancelled during the wait."""
+        while not self._pause_gate.wait(timeout=0.1):
+            if self._cancelled:
+                return False
+        return not self._cancelled
 
     def run(self) -> None:
         try:
@@ -331,7 +408,7 @@ class CleanupWorker(QThread):
                 self.finished_signal.emit(1)
                 return
             self.log_signal.emit(f"Fetching workflow runs for {self.repo}...")
-            runs = list_runs(self.repo)
+            runs = list_runs(self.repo, self.fetch_limit)
             if self.failed_only:
                 runs = filter_failed_runs(runs)
                 self.log_signal.emit(
@@ -357,6 +434,15 @@ class CleanupWorker(QThread):
         kept = len(kept_ids)
         total = len(delete_ids)
 
+        # Optional per-run deletion cap (0 == unlimited).
+        if self.max_deletions and total > self.max_deletions:
+            self.log_signal.emit(
+                f"Max deletions cap of {self.max_deletions} reached; "
+                f"processing the first {self.max_deletions} of {total} run(s)."
+            )
+            delete_ids = delete_ids[: self.max_deletions]
+            total = len(delete_ids)
+
         if total == 0:
             self.log_signal.emit(
                 f"Nothing to delete — all {kept} run(s) belong to the "
@@ -374,7 +460,7 @@ class CleanupWorker(QThread):
         failed = 0
         if self.dry_run:
             for run_id in delete_ids:
-                if self._cancelled:
+                if not self._wait_if_paused():
                     break
                 done += 1
                 self.log_signal.emit(f"  DRY-RUN: would delete run {run_id}")
@@ -382,7 +468,7 @@ class CleanupWorker(QThread):
                     self.progress_signal.emit(done)
         else:
             for run_id in delete_ids:
-                if self._cancelled:
+                if not self._wait_if_paused():
                     break
                 ok, detail = delete_run(self.repo, run_id)
                 done += 1
@@ -404,6 +490,40 @@ class CleanupWorker(QThread):
             return
         self.log_signal.emit("Cleanup complete.")
         self.finished_signal.emit(0)
+
+
+#: Directory holding the packaged icon assets (SVG source + rendered rasters).
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+
+
+def _icon_candidate_dirs() -> list[Path]:
+    """Directories searched for the icon (dev checkout and frozen builds)."""
+    dirs = [ASSETS_DIR]
+    if getattr(sys, "frozen", False):
+        # In a Nuitka standalone build the data files ship next to the exe.
+        dirs.append(Path(sys.executable).resolve().parent / "assets")
+    return dirs
+
+
+def find_icon_file() -> Path | None:
+    """Return the packaged icon path, preferring ``.ico`` on Windows."""
+    names = ("icon.ico", "icon.png") if os.name == "nt" else ("icon.png", "icon.ico")
+    for directory in _icon_candidate_dirs():
+        for name in names:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def load_app_icon() -> QIcon:
+    """Load the designed icon asset, falling back to the drawn icon."""
+    icon_file = find_icon_file()
+    if icon_file is not None:
+        icon = QIcon(str(icon_file))
+        if not icon.isNull():
+            return icon
+    return build_window_icon()
 
 
 def build_window_icon() -> QIcon:
@@ -429,7 +549,7 @@ class MainWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"GitHub Actions Cleaner {VERSION}")
-        self.setWindowIcon(build_window_icon())
+        self.setWindowIcon(load_app_icon())
         self.worker: CleanupWorker | None = None
         self._close_pending = False
         self._repos: list[str] = load_repos()
@@ -437,9 +557,11 @@ class MainWindow(QWidget):
         self._last_dry_run = True
         self._last_summary = (0, 0, 0)
         self.setup_ui()
-        keep, failed_only = load_preferences()
+        keep, failed_only, fetch_limit, max_deletions = load_preferences()
         self.keep_spin.setValue(keep)
         self.failed_only_check.setChecked(failed_only)
+        self.fetch_limit_spin.setValue(fetch_limit)
+        self.max_deletions_spin.setValue(max_deletions)
         self._refresh_cleanup_enabled()
 
     def setup_ui(self) -> None:
@@ -481,6 +603,25 @@ class MainWindow(QWidget):
         self.keep_spin.setToolTip("How many newest commits' runs to preserve")
         form_layout.addRow("Commits to keep:", self.keep_spin)
 
+        self.fetch_limit_spin = QSpinBox()
+        self.fetch_limit_spin.setRange(FETCH_LIMIT_MIN, FETCH_LIMIT_MAX)
+        self.fetch_limit_spin.setSingleStep(100)
+        self.fetch_limit_spin.setValue(FETCH_LIMIT_DEFAULT)
+        self.fetch_limit_spin.setToolTip(
+            "How many most-recent runs to fetch (gh paginates automatically)"
+        )
+        form_layout.addRow("Runs to fetch:", self.fetch_limit_spin)
+
+        self.max_deletions_spin = QSpinBox()
+        self.max_deletions_spin.setRange(MAX_DELETIONS_MIN, MAX_DELETIONS_MAX)
+        self.max_deletions_spin.setSingleStep(10)
+        self.max_deletions_spin.setValue(MAX_DELETIONS_MIN)
+        self.max_deletions_spin.setSpecialValueText("No limit")
+        self.max_deletions_spin.setToolTip(
+            "Stop after deleting this many runs in one pass (0 = no limit)"
+        )
+        form_layout.addRow("Max deletions:", self.max_deletions_spin)
+
         self.dry_run_check = QCheckBox("Dry run (don't actually delete)")
         self.dry_run_check.setChecked(True)
         form_layout.addRow("", self.dry_run_check)
@@ -497,6 +638,10 @@ class MainWindow(QWidget):
         self.cancel_btn.setVisible(False)
         self.cancel_btn.clicked.connect(self.cancel_cleanup)
 
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.setVisible(False)
+        self.pause_btn.clicked.connect(self.toggle_pause)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
 
@@ -512,6 +657,7 @@ class MainWindow(QWidget):
         button_row = QHBoxLayout()
         button_row.addWidget(self.cleanup_btn)
         button_row.addWidget(self.cancel_btn)
+        button_row.addWidget(self.pause_btn)
         layout.addLayout(button_row)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.log_output)
@@ -607,7 +753,10 @@ class MainWindow(QWidget):
         self.log_output.clear()
         self.summary_label.setVisible(False)
         if not save_preferences(
-            self.keep_spin.value(), self.failed_only_check.isChecked()
+            self.keep_spin.value(),
+            self.failed_only_check.isChecked(),
+            self.fetch_limit_spin.value(),
+            self.max_deletions_spin.value(),
         ):
             self.log_output.appendPlainText(
                 f"Warning: could not write {PREFERENCES_PATH}"
@@ -617,12 +766,17 @@ class MainWindow(QWidget):
         self.progress_bar.setValue(0)
         self.cancel_btn.setVisible(True)
         self.cancel_btn.setEnabled(True)
+        self.pause_btn.setVisible(True)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Pause")
 
         self.worker = CleanupWorker(
             repo,
             self.keep_spin.value(),
             dry_run,
             self.failed_only_check.isChecked(),
+            fetch_limit=self.fetch_limit_spin.value(),
+            max_deletions=self.max_deletions_spin.value(),
         )
         self.worker.log_signal.connect(self.log_output.appendPlainText)
         self.worker.max_signal.connect(self.progress_bar.setMaximum)
@@ -637,9 +791,20 @@ class MainWindow(QWidget):
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
             self.cancel_btn.setEnabled(False)
+            self.pause_btn.setEnabled(False)
             self.log_output.appendPlainText(
                 "Cancelling — waiting for the current operation to finish..."
             )
+
+    def toggle_pause(self) -> None:
+        if self.worker is None or not self.worker.isRunning():
+            return
+        pausing = not self.worker.paused
+        self.worker.set_paused(pausing)
+        self.pause_btn.setText("Resume" if pausing else "Pause")
+        self.log_output.appendPlainText(
+            "Paused — click Resume to continue." if pausing else "Resuming..."
+        )
 
     def on_summary(self, kept: int, deleted: int, failed: int) -> None:
         self._last_summary = (kept, deleted, failed)
@@ -648,6 +813,9 @@ class MainWindow(QWidget):
         """Reset UI state and report the outcome (0 ok, 1 fail, 2 cancel)."""
         self.cancel_btn.setVisible(False)
         self.cancel_btn.setEnabled(True)
+        self.pause_btn.setVisible(False)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Pause")
         self.progress_bar.setVisible(False)
         self._refresh_cleanup_enabled()
 

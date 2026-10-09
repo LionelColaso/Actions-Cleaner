@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 from collections.abc import Callable
 
 import pytest
@@ -37,14 +38,16 @@ class _GhMock:
         self.delete_ok = True
         self.delete_detail = ""
         self.delete_calls: list[str] = []
+        self.list_fetch_limit = 0
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_auth() -> str:
             return self.auth_error
 
-        def fake_list(repo: str) -> list[app.RunInfo]:
+        def fake_list(repo: str, fetch_limit: int = 0) -> list[app.RunInfo]:
             if self.list_error is not None:
                 raise self.list_error
+            self.list_fetch_limit = fetch_limit
             return list(self.runs)
 
         def fake_delete(repo: str, run_id: str) -> tuple[bool, str]:
@@ -67,6 +70,18 @@ def _run_worker(worker: app.CleanupWorker) -> WorkerResult:
     worker.progress_signal.connect(result.progress.append)
     worker.run()  # synchronous; same-thread signal connections are direct
     return result
+
+
+def _run_with_release(
+    worker: app.CleanupWorker, release: Callable[[], object]
+) -> WorkerResult:
+    """Run the worker, firing `release` on a timer so a paused run() wakes."""
+    timer = threading.Timer(0.2, release)
+    timer.start()
+    try:
+        return _run_worker(worker)
+    finally:
+        timer.join()
 
 
 def _sample_runs(make_run: MakeRun) -> list[app.RunInfo]:
@@ -232,3 +247,95 @@ def test_cancel_stops_before_deleting(
 
     assert result.finished == [2]
     assert any("cancelled" in line.lower() for line in result.logs)
+
+
+def test_fetch_limit_is_passed_to_list_runs(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    gh = _GhMock()
+    gh.runs = _sample_runs(make_run)
+    gh.install(monkeypatch)
+
+    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True, fetch_limit=250)
+    _run_worker(worker)
+
+    assert gh.list_fetch_limit == 250
+
+
+def test_max_deletions_caps_processed_runs(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    gh = _GhMock()
+    gh.runs = [
+        make_run(1, "old-a", "2024-05-01T00:00:00Z"),
+        make_run(2, "old-b", "2024-05-02T00:00:00Z"),
+        make_run(3, "old-c", "2024-05-03T00:00:00Z"),
+        make_run(4, "new", "2024-06-01T00:00:00Z"),
+    ]
+    gh.install(monkeypatch)
+
+    # keep=1 protects the "new" commit; 3 old runs would be deleted, but the
+    # cap stops after the first 2.
+    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, max_deletions=2)
+    result = _run_worker(worker)
+
+    assert len(gh.delete_calls) == 2
+    assert result.finished == [0]
+    assert result.maxes == [2]
+    assert any("Max deletions cap of 2" in line for line in result.logs)
+
+
+def test_max_deletions_zero_means_unlimited(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    gh = _GhMock()
+    gh.runs = _sample_runs(make_run)
+    gh.install(monkeypatch)
+
+    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, max_deletions=0)
+    result = _run_worker(worker)
+
+    assert len(gh.delete_calls) == 1  # only run 3 is deletable here
+    assert result.finished == [0]
+
+
+def test_pause_blocks_until_resumed(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    gh = _GhMock()
+    gh.runs = [
+        make_run(10, "old", "2024-05-01T00:00:00Z"),
+        make_run(11, "new", "2024-06-01T00:00:00Z"),
+    ]
+    gh.install(monkeypatch)
+
+    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False)
+    worker.set_paused(True)
+    assert worker.paused is True
+
+    # Released on a timer: proves run() blocked on the gate, not ignored it.
+    result = _run_with_release(worker, lambda: worker.set_paused(False))
+
+    assert result.finished == [0]
+    assert gh.delete_calls == ["10"]
+
+
+def test_cancel_releases_a_paused_worker(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    gh = _GhMock()
+    gh.runs = [
+        make_run(20, "old", "2024-05-01T00:00:00Z"),
+        make_run(21, "new", "2024-06-01T00:00:00Z"),
+    ]
+    gh.delete_error = AssertionError("paused-then-cancelled run must not delete")
+    gh.install(monkeypatch)
+
+    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False)
+    worker.set_paused(True)
+
+    # A pause + cancel must not deadlock; run() exits as cancelled.
+    result = _run_with_release(worker, worker.cancel)
+
+    assert result.finished == [2]
+    assert gh.delete_calls == []

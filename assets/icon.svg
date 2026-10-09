@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Actions Cleaner">
+  <defs>
+    <linearGradient id="lid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff7d72"/>
+      <stop offset="1" stop-color="#e04a40"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f2594f"/>
+      <stop offset="1" stop-color="#bf342a"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.30"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0.04"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.16"/>
+    </linearGradient>
+  </defs>
+
+  <!-- lid handle -->
+  <rect x="98" y="24" width="60" height="20" rx="10" fill="#8d2e26"/>
+  <!-- lid -->
+  <rect x="44" y="44" width="168" height="28" rx="14" fill="url(#lid)"/>
+  <!-- body -->
+  <path d="M64 78 H192 L184 208 A20 20 0 0 1 164 226 H92 A20 20 0 0 1 72 208 Z" fill="url(#body)"/>
+  <!-- cylindrical shading -->
+  <path d="M64 78 H192 L184 208 A20 20 0 0 1 164 226 H92 A20 20 0 0 1 72 208 Z" fill="url(#shine)"/>
+  <!-- vertical slats -->
+  <g fill="#ffffff" opacity="0.9">
+    <rect x="104" y="100" width="11" height="94" rx="5.5"/>
+    <rect x="141" y="100" width="11" height="94" rx="5.5"/>
+  </g>
+</svg>

@@ -24,10 +24,12 @@ auth, rate limiting, and pagination.
 │  │  - Repository input + Add/Remove buttons                 ││
 │  │  - Saved repositories dropdown (persisted to JSON)       ││
 │  │  - Commits to keep (spin box, default 2, persisted)      ││
+│  │  - Runs to fetch (spin box, default 1000, persisted)     ││
+│  │  - Max deletions (spin box, default No limit, persisted) ││
 │  │  - Dry run checkbox (default checked, never persisted)   ││
 │  │  - Failed / cancelled only checkbox                      ││
 │  └─────────────────────────────────────────────────────────┘│
-│  [ Clean Up Actions ] [ Cancel (while running) ]              │
+│  [ Clean Up Actions ] [ Cancel (while running) ] [ Pause ]   │
 │  ┌─────────────────────────────────────────────────────────┐│
 │  │ Progress bar + summary label (kept/deleted/failed/elapsed)│
 │  │ Log output (QPlainTextEdit, read-only, capped)           ││
@@ -38,8 +40,9 @@ auth, rate limiting, and pagination.
 ┌─────────────────────────────────────────────────────────────┐
 │  CleanupWorker (QThread)                                     │
 │  1. gh auth status  (preflight, fails fast when logged out)  │
-│  2. gh run list --repo <owner/repo> --limit 1000             │
+│  2. gh run list --repo <owner/repo> --limit <N>               │
 │     --json databaseId,headSha,createdAt,conclusion           │
+│     [N = "Runs to fetch", default 1000; gh auto-paginates]   │
 │     [client-side filter when failed-only is enabled]         │
 │  3. Sort by createdAt, keep runs of the latest N commits     │
 │  4. Delete other runs one at a time via                      │
@@ -69,8 +72,9 @@ Add/Remove handlers; repopulation blocks signals so typed input survives.
 **Subprocess contract:** the app invokes exactly three `gh` commands, all with
 list-form arguments (no `shell=True`) and timeouts:
 - `gh auth status` (preflight, `GH_AUTH_TIMEOUT`)
-- `gh run list --repo <repo> --limit 1000`
-  `--json databaseId,headSha,createdAt,conclusion` (`GH_LIST_TIMEOUT`)
+- `gh run list --repo <repo> --limit <N>`
+  `--json databaseId,headSha,createdAt,conclusion` (`GH_LIST_TIMEOUT`;
+  `N` = "Runs to fetch", default 1000, `gh` paginates internally)
 - `gh run delete <run_id> --repo <repo>` (one per run, `GH_DELETE_TIMEOUT`)
 
 `subprocess.CalledProcessError`, `OSError`, and `ValueError`/`TypeError` from

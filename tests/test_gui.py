@@ -354,5 +354,67 @@ def test_start_cleanup_full_lifecycle(
     assert not window.summary_label.isHidden()
     assert len(dialogs["information"]) == 1
     prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
-    assert prefs == {"keep": 7, "failed_only": False}
+    assert prefs == {
+        "keep": 7,
+        "failed_only": False,
+        "fetch_limit": app.FETCH_LIMIT_DEFAULT,
+        "max_deletions": 0,
+    }
+    window.close()
+
+
+# --- pause/resume + new options --------------------------------------------
+
+
+class _PausableWorker(app.CleanupWorker):
+    """Worker that stays 'running' and records pause-state changes."""
+
+    def __init__(self) -> None:
+        super().__init__("owner/repo", 2, True)
+        self.pause_calls: list[bool] = []
+
+    def isRunning(self) -> bool:
+        return True
+
+    @property
+    def paused(self) -> bool:
+        return bool(self.pause_calls and self.pause_calls[-1])
+
+    def set_paused(self, paused: bool) -> None:
+        self.pause_calls.append(paused)
+
+
+def test_pause_button_toggles_and_relabels() -> None:
+    window = app.MainWindow()
+    worker = _PausableWorker()
+    window.worker = worker
+
+    window.toggle_pause()
+    assert worker.pause_calls == [True]
+    assert window.pause_btn.text() == "Resume"
+
+    window.toggle_pause()
+    assert worker.pause_calls == [True, False]
+    assert window.pause_btn.text() == "Pause"
+    window.worker = None
+    window.close()
+
+
+def test_pause_button_ignored_without_running_worker() -> None:
+    window = app.MainWindow()
+    window.worker = None
+    # No worker -> toggle is a no-op and does not raise.
+    window.toggle_pause()
+    assert window.pause_btn.text() == "Pause"
+    window.close()
+
+
+def test_new_option_spin_boxes_exist_with_defaults() -> None:
+    window = app.MainWindow()
+    assert window.fetch_limit_spin.value() == app.FETCH_LIMIT_DEFAULT
+    assert window.max_deletions_spin.value() == 0
+    assert window.max_deletions_spin.specialValueText() == "No limit"
+    # Bounds are enforced by the widget.
+    assert window.fetch_limit_spin.minimum() == app.FETCH_LIMIT_MIN
+    assert window.fetch_limit_spin.maximum() == app.FETCH_LIMIT_MAX
     window.close()

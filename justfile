@@ -123,6 +123,10 @@ build *ARGS='': check
 build-version VERSION: check
     uv run python scripts/build.py --product-version="{{VERSION}}"
 
+# Regenerate the app icon rasters (assets/icon.png + icon.ico) from icon.svg
+icon:
+    uv run python scripts/make_icon.py
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Utilities
 # ═══════════════════════════════════════════════════════════════════════════
