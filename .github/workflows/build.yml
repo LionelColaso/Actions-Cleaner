@@ -51,11 +51,6 @@ jobs:
           sudo apt-get install -y libegl1 libgl1 libglx-mesa0 libglib2.0-0 libxkbcommon0 libxkbcommon-x11-0 libxcb-cursor0
         shell: bash
 
-      - name: Install coreutils (for timeout) on macOS
-        if: runner.os == 'macOS'
-        run: brew install coreutils
-        shell: bash
-
       - name: Sync dependencies (build group, no dev)
         run: uv sync --locked --no-dev --group build
 
@@ -89,26 +84,27 @@ jobs:
       - name: Launch smoke test (built executable runs)
         shell: bash
         run: |
+          EXE="${{ steps.find_executable.outputs.EXECUTABLE }}"
+          echo "Testing executable: $EXE"
           if [ "$RUNNER_OS" != "Windows" ]; then
             export QT_QPA_PLATFORM=offscreen
           fi
-          EXE="${{ steps.find_executable.outputs.EXECUTABLE }}"
-          echo "Testing executable: $EXE"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            timeout 10 "$EXE" || EXIT_CODE=$?
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            gtimeout 10 "$EXE" || EXIT_CODE=$?
-          else
-            timeout 10 "$EXE" || EXIT_CODE=$?
-          fi
-          if [ "${EXIT_CODE:-0}" = "124" ]; then
-            echo "Executable launched successfully (timed out as expected)"
-          elif [ "${EXIT_CODE:-0}" = "0" ]; then
-            echo "Executable ran and exited cleanly"
-          else
-            echo "Executable failed with exit code ${EXIT_CODE:-0}"
-            exit "${EXIT_CODE:-1}"
-          fi
+          # Python-based launch check: no dependency on GNU `timeout`.
+          python - "$EXE" <<'PY'
+          import subprocess
+          import sys
+
+          exe = sys.argv[1]
+          try:
+              code = subprocess.run([exe], timeout=10).returncode
+          except subprocess.TimeoutExpired:
+              code = 124  # still running after 10s => GUI launched
+          if code in (0, 124):
+              print(f"Executable launched successfully (exit code {code})")
+              sys.exit(0)
+          print(f"Executable failed with exit code {code}", file=sys.stderr)
+          sys.exit(code or 1)
+          PY
 
       - name: Generate build attestation
         uses: actions/attest-build-provenance@v4

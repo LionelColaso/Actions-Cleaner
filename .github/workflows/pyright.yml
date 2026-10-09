@@ -1,11 +1,9 @@
 name: Pyright
 
+# Reusable only — called by ci.yml (PRs) and auto_build.yml (pushes to main).
 on:
   workflow_call:
   workflow_dispatch:
-  push:
-    branches: [main]
-  pull_request:
 
 jobs:
   pyright:

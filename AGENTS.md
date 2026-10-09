@@ -103,8 +103,8 @@ Actions-Cleaner/
 └── .github/workflows/
     ├── build.yml            # reusable per-OS Nuitka build
     ├── release.yml          # manual Stable/Edge GitHub release
-    ├── auto_build.yml       # push to main → Edge release
-    ├── ci.yml               # PR gate: lint + pyright + pytest + build
+    ├── auto_build.yml       # push to main: verify all + Edge release
+    ├── ci.yml               # PR gate: verify all before merge to main
     ├── lint.yml             # ruff + mypy
     ├── pyright.yml          # pyright
     └── pytest.yml           # pytest headless
