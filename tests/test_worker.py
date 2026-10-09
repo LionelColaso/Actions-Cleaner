@@ -105,6 +105,31 @@ def _sample_runs(make_run: MakeRun) -> list[app.RunInfo]:
     ]
 
 
+def _four_run_sample(make_run: MakeRun) -> list[app.RunInfo]:
+    """Three old commits + one new — used by max-deletions and concurrency tests."""
+    return [
+        make_run(1, "old-a", "2024-05-01T00:00:00Z"),
+        make_run(2, "old-b", "2024-05-02T00:00:00Z"),
+        make_run(3, "old-c", "2024-05-03T00:00:00Z"),
+        make_run(4, "new", "2024-06-01T00:00:00Z"),
+    ]
+
+
+def _install_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    make_run: MakeRun,
+    runs: list[app.RunInfo],
+    **kwargs: object,
+) -> tuple[_GhMock, app.CleanupWorker, WorkerResult]:
+    """Install a fresh mock with `runs`, build a worker, run it, return all three."""
+    gh = _GhMock()
+    gh.runs = runs
+    gh.install(monkeypatch)
+    worker = app.CleanupWorker("owner/repo", **kwargs)  # type: ignore[arg-type]
+    result = _run_worker(worker)
+    return gh, worker, result
+
+
 def test_dry_run_never_deletes(
     monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
 ) -> None:
@@ -278,20 +303,17 @@ def test_fetch_limit_is_passed_to_list_runs(
 def test_max_deletions_caps_processed_runs(
     monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
 ) -> None:
-    gh = _GhMock()
-    gh.runs = [
-        make_run(1, "old-a", "2024-05-01T00:00:00Z"),
-        make_run(2, "old-b", "2024-05-02T00:00:00Z"),
-        make_run(3, "old-c", "2024-05-03T00:00:00Z"),
-        make_run(4, "new", "2024-06-01T00:00:00Z"),
-    ]
-    gh.install(monkeypatch)
+    gh, _worker, result = _install_worker(
+        monkeypatch,
+        make_run,
+        _four_run_sample(make_run),
+        keep=1,
+        dry_run=False,
+        max_deletions=2,
+    )
 
     # keep=1 protects the "new" commit; 3 old runs would be deleted, but the
     # cap stops after the first 2.
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, max_deletions=2)
-    result = _run_worker(worker)
-
     assert len(gh.delete_calls) == 2
     assert result.finished == [0]
     assert result.maxes == [2]
@@ -301,12 +323,14 @@ def test_max_deletions_caps_processed_runs(
 def test_max_deletions_zero_means_unlimited(
     monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
 ) -> None:
-    gh = _GhMock()
-    gh.runs = _sample_runs(make_run)
-    gh.install(monkeypatch)
-
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, max_deletions=0)
-    result = _run_worker(worker)
+    gh, _worker, result = _install_worker(
+        monkeypatch,
+        make_run,
+        _sample_runs(make_run),
+        keep=1,
+        dry_run=False,
+        max_deletions=0,
+    )
 
     assert len(gh.delete_calls) == 1  # only run 3 is deletable here
     assert result.finished == [0]
@@ -315,12 +339,14 @@ def test_max_deletions_zero_means_unlimited(
 def test_concurrency_one_is_sequential(
     monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
 ) -> None:
-    gh = _GhMock()
-    gh.runs = _sample_runs(make_run)
-    gh.install(monkeypatch)
-
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, concurrency=1)
-    result = _run_worker(worker)
+    gh, _worker, result = _install_worker(
+        monkeypatch,
+        make_run,
+        _sample_runs(make_run),
+        keep=1,
+        dry_run=False,
+        concurrency=1,
+    )
 
     assert gh.delete_calls == ["3"]
     assert result.finished == [0]
@@ -331,17 +357,14 @@ def test_concurrency_parallel_deletes_all(
 ) -> None:
     """A pool of workers still deletes every targeted run; failed IDs are
     reported by name in the log instead of just a count."""
-    gh = _GhMock()
-    gh.runs = [
-        make_run(1, "old-a", "2024-05-01T00:00:00Z"),
-        make_run(2, "old-b", "2024-05-02T00:00:00Z"),
-        make_run(3, "old-c", "2024-05-03T00:00:00Z"),
-        make_run(4, "new", "2024-06-01T00:00:00Z"),
-    ]
-    gh.install(monkeypatch)
-
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, concurrency=4)
-    result = _run_worker(worker)
+    gh, _worker, result = _install_worker(
+        monkeypatch,
+        make_run,
+        _four_run_sample(make_run),
+        keep=1,
+        dry_run=False,
+        concurrency=4,
+    )
 
     assert set(gh.delete_calls) == {"1", "2", "3"}
     assert result.finished == [0]
