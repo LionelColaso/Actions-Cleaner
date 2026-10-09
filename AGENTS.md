@@ -23,25 +23,27 @@ auth, rate limiting, and pagination.
 │  │ Settings group                                           ││
 │  │  - Repository input + Add/Remove buttons                 ││
 │  │  - Saved repositories dropdown (persisted to JSON)       ││
-│  │  - Runs to keep (spin box, default 2)                    ││
-│  │  - Dry run checkbox                                      ││
-│  │  - Failed workflows only checkbox                        ││
+│  │  - Commits to keep (spin box, default 2, persisted)      ││
+│  │  - Dry run checkbox (default checked, never persisted)   ││
+│  │  - Failed / cancelled only checkbox                      ││
 │  └─────────────────────────────────────────────────────────┘│
-│  [ Clean Up Actions ]                                        │
+│  [ Clean Up Actions ] [ Cancel (while running) ]              │
 │  ┌─────────────────────────────────────────────────────────┐│
-│  │ Progress bar                                             ││
-│  │ Log output (QTextEdit, read-only)                        ││
+│  │ Progress bar + summary label (kept/deleted/failed/elapsed)│
+│  │ Log output (QPlainTextEdit, read-only, capped)           ││
 │  └─────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  CleanupWorker (QThread)                                     │
-│  1. gh run list --repo <owner/repo> --limit 1000             │
-│     --json databaseId,headSha                                │
-│     [--status failure] (when failed-only is enabled)          │
-│  2. Group runs by headSha, keep latest N commits             │
-│  3. Delete all other runs via gh run delete                  │
+│  1. gh auth status  (preflight, fails fast when logged out)  │
+│  2. gh run list --repo <owner/repo> --limit 1000             │
+│     --json databaseId,headSha,createdAt,conclusion           │
+│     [client-side filter when failed-only is enabled]         │
+│  3. Sort by createdAt, keep runs of the latest N commits     │
+│  4. Delete other runs one at a time via                      │
+│     gh run delete <run_id> --repo <repo> (list-form args)    │
 │  Progress + log emitted via Qt signals to MainWindow         │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -49,20 +51,31 @@ auth, rate limiting, and pagination.
 **Worker thread:** `CleanupWorker` extends `QThread`. All `subprocess.run` calls
 happen in `run()`, never on the GUI thread. Progress and log lines are emitted
 through `Signal(str)`, `Signal(int)` (progress), and `Signal(int)` (max) connections,
-which Qt auto-queues to the GUI thread.
+which Qt auto-queues to the GUI thread, plus `summary_signal`
+(`Signal(int, int, int)` = kept/deleted/failed). `finished_signal` carries the
+outcome: `0` success, `1` failure, `2` cancelled. Closing the window while a
+worker runs cancels it and defers the close until the thread stops — a running
+`QThread` is never destroyed.
 
-**Repository persistence:** Saved repos are stored as a JSON array in
-`~/.actions-cleaner-repos.json`. `load_repos()` / `save_repos()` handle the
-file. The dropdown (`QComboBox`) and line edit stay in sync via
-`currentTextChanged` and Add/Remove button handlers.
+**Repository persistence:** Saved repos are stored as a bare JSON array in
+`~/.actions-cleaner-repos.json` (`load_repos()` / `save_repos()` handle the
+file; the legacy `{"repos": [...]}` shape is still readable). Preferences
+(`keep`, `failed_only`) live in a separate
+`~/.actions-cleaner-settings.json`; **dry-run is deliberately never
+persisted** so the app always starts safe. The dropdown (`QComboBox`) and line
+edit stay in sync via `currentTextChanged` (guarded against empty text) and
+Add/Remove handlers; repopulation blocks signals so typed input survives.
 
-**Subprocess contract:** the app invokes exactly two `gh` commands:
-- `gh run list --repo <repo> --limit 1000 --json databaseId,headSha`
-  `[--status failure]` (when failed-only is enabled)
-- `gh run delete <run_id> --repo <repo>`
+**Subprocess contract:** the app invokes exactly three `gh` commands, all with
+list-form arguments (no `shell=True`) and timeouts:
+- `gh auth status` (preflight, `GH_AUTH_TIMEOUT`)
+- `gh run list --repo <repo> --limit 1000`
+  `--json databaseId,headSha,createdAt,conclusion` (`GH_LIST_TIMEOUT`)
+- `gh run delete <run_id> --repo <repo>` (one per run, `GH_DELETE_TIMEOUT`)
 
-`subprocess.CalledProcessError` is caught and surfaced in the log; the app
-never crashes on `gh` failures.
+`subprocess.CalledProcessError`, `OSError`, and `ValueError`/`TypeError` from
+parsing are caught and surfaced in the log; the app never crashes on `gh`
+failures and always re-enables the UI.
 
 ---
 
@@ -81,7 +94,12 @@ Actions-Cleaner/
 ├── scripts/
 │   ├── build.py             # Nuitka standalone build entrypoint
 │   └── clean.py             # remove build artifacts / caches
-├── tests/                   # test directory (empty for now)
+├── tests/                   # pytest suite (selection, persistence, worker, GUI)
+│   ├── conftest.py          # QApplication + settings-path fixtures
+│   ├── test_repo_store.py   # load/save repos & preferences, validation
+│   ├── test_selection.py    # pure run-selection / failed-filter logic
+│   ├── test_worker.py       # CleanupWorker with the gh CLI mocked
+│   └── test_gui.py          # MainWindow flows (offscreen, dialogs captured)
 └── .github/workflows/
     ├── build.yml            # reusable per-OS Nuitka build
     ├── release.yml          # manual Stable/Edge GitHub release
@@ -99,8 +117,8 @@ Actions-Cleaner/
 - `just build` → Nuitka `--standalone` into `build/` via `scripts/build.py`.
 - `just build-version 0.1.0.0` sets a product version.
 - `just run` → `uv run python actions_cleaner_gui.py` (dev mode).
-- `just check` → ruff format, ruff lint, mypy, pyright.
-- `just test` → pytest (skips if `tests/` is empty).
+- `just check` → ruff format, ruff lint, mypy, pyright, jscpd (needs Node.js).
+- `just test` → pytest (exits non-zero on failures; skips only on no tests).
 - `just ci` → full local CI simulation.
 - Python: **3.14** (matches `llama_gui`).
 - Framework: **PySide6 6.7+**.
@@ -114,11 +132,13 @@ Actions-Cleaner/
    direct widget access from `run()` is undefined behaviour.
 2. **No plaintext secrets.** The `gh` CLI handles auth via its own keychain;
    the app never reads or stores tokens.
-3. **Dry run is the default.** The checkbox starts checked; the app must not
-   delete anything until the user unchecks it.
-4. **Repository input is validated before every run.** Empty or malformed
-   `owner/repo` is rejected with a `QMessageBox` warning; no subprocess is
-   spawned.
+3. **Dry run is the default.** The checkbox starts checked on every launch
+   (its state is never persisted); the app must not delete anything until the
+   user unchecks it.
+4. **Repository input is validated before every run.** GitHub URLs (and
+   SSH remotes) are first reduced to `owner/repo` (`normalize_repo()`);
+   empty or malformed input is rejected with a `QMessageBox` warning; no
+   subprocess is spawned.
 5. **Saved repos are a simple JSON list.** No duplicates, no external
    dependencies, human-readable file at `~/.actions-cleaner-repos.json`.
 

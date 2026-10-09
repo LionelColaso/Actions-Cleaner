@@ -4,17 +4,18 @@ A PySide6 desktop app that cleans up [GitHub Actions](https://github.com/feature
 
 ## Features
 
-- **Repository management:** Save and manage multiple repositories with a dropdown; add/remove repos locally.
-- **Flexible retention:** Configure how many commits' worth of runs to keep (default: 2).
-- **Failed-only filter:** Optionally target only failed workflow runs for cleanup.
-- **Dry-run mode:** Preview what would be deleted before committing — safe by default.
-- **Background processing:** All GitHub API calls happen off the GUI thread; progress and logs stream in real time.
-- **Persistent settings:** Saved repositories are stored locally in `~/.actions-cleaner-repos.json`.
+- **Repository management:** Save and manage multiple repositories with a dropdown; add/remove repos locally (validated as `owner/repo`).
+- **Flexible retention:** Configure how many commits' worth of runs to keep (default: 2); the choice is remembered.
+- **Failed-only filter:** Optionally target only failed, cancelled or timed-out workflow runs for cleanup.
+- **Dry-run mode:** Preview what would be deleted before committing — always on by default (and never remembered, so every launch starts safe).
+- **Background processing:** All GitHub API calls happen off the GUI thread; progress and logs stream in real time, with a Cancel button and a final summary (kept / deleted / failed / elapsed).
+- **Persistent settings:** Saved repositories live in `~/.actions-cleaner-repos.json` (a plain JSON array); `keep`/`failed_only` preferences live in `~/.actions-cleaner-settings.json`.
 
 ## Requirements
 
 - Python **3.14** (via [uv](https://docs.astral.sh/uv/))
 - [`gh` CLI](https://cli.github.com/) authenticated (`gh auth login`)
+- Node.js (`npx`, only for the `jscpd` step of `just check`)
 
 ## Quick start
 
@@ -30,11 +31,13 @@ uv run python actions_cleaner_gui.py
 
 ## Usage
 
-1. Add a repository (e.g. `owner/repo`) and click **Add**.
-2. Set **Runs to keep** (how many recent commits to preserve).
-3. Optionally check **Failed workflows only** to clean up failed runs exclusively.
+1. Add a repository — `owner/repo` **or** a full GitHub URL (e.g. `https://github.com/owner/repo`; URLs are reduced to `owner/repo`) — and click **Add**.
+2. Set **Commits to keep** (how many recent commits to preserve).
+3. Optionally check **Failed / cancelled only** to target unsuccessful runs exclusively.
 4. Ensure **Dry run** is checked for a preview, then click **Clean Up Actions**.
 5. Uncheck **Dry run** when ready to delete.
+
+Only the **1000 most recent runs** per repository are scanned (`gh run list --limit 1000`), ordered by creation date. Use **Cancel** to stop a running cleanup; closing the window mid-run waits for the current `gh` call to finish before quitting.
 
 ## Build
 

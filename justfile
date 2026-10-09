@@ -6,7 +6,7 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 # ─── Global Variables ────────────────────────────────────────────────────
 config_and_path := "--config pyproject.toml ."
 pytest_opts := "--no-qt-log -s -ra"
-cov_opts := "--cov=. --cov-report=xml --cov-report=html --cov-report=term-missing --junitxml=junit/test-results.xml"
+cov_opts := "--cov=actions_cleaner_gui --cov-report=xml --cov-report=html --cov-report=term-missing --junitxml=junit/test-results.xml"
 
 # ─── Default Target ──────────────────────────────────────────────────────
 @default:
@@ -23,29 +23,29 @@ run: dev-setup
 # Run all tests (skips gracefully if tests/ does not exist or is empty)
 [unix]
 test: dev-setup
-    uv run pytest {{pytest_opts}} -q tests/ || echo "No tests ran"
+    uv run pytest {{pytest_opts}} -q tests/; rc=$?; if [ $rc -eq 5 ]; then echo "No tests ran"; exit 0; else exit $rc; fi
 
 [windows]
 test: dev-setup
-    uv run pytest {{pytest_opts}} -q tests/; if ($LASTEXITCODE -eq 5) { echo "No tests ran" }
+    uv run pytest {{pytest_opts}} -q tests/; $rc=$LASTEXITCODE; if ($rc -eq 5) { echo "No tests ran"; exit 0 }; exit $rc
 
 # Run tests with verbose output and short tracebacks
 [unix]
 test-verbose: dev-setup
-    uv run pytest {{pytest_opts}} -v --tb=short tests/ || echo "No tests ran"
+    uv run pytest {{pytest_opts}} -v --tb=short tests/; rc=$?; if [ $rc -eq 5 ]; then echo "No tests ran"; exit 0; else exit $rc; fi
 
 [windows]
 test-verbose: dev-setup
-    uv run pytest {{pytest_opts}} -v --tb=short tests/; if ($LASTEXITCODE -eq 5) { echo "No tests ran" }
+    uv run pytest {{pytest_opts}} -v --tb=short tests/; $rc=$LASTEXITCODE; if ($rc -eq 5) { echo "No tests ran"; exit 0 }; exit $rc
 
 # Run tests and emit an HTML coverage report + XML for CI uploads
 [unix]
 coverage: dev-setup
-    uv run pytest {{pytest_opts}} {{cov_opts}} tests/ || echo "No tests ran"
+    uv run pytest {{pytest_opts}} {{cov_opts}} tests/; rc=$?; if [ $rc -eq 5 ]; then echo "No tests ran"; exit 0; else exit $rc; fi
 
 [windows]
 coverage: dev-setup
-    uv run pytest {{pytest_opts}} {{cov_opts}} tests/; if ($LASTEXITCODE -eq 5) { echo "No tests ran" }
+    uv run pytest {{pytest_opts}} {{cov_opts}} tests/; $rc=$LASTEXITCODE; if ($rc -eq 5) { echo "No tests ran"; exit 0 }; exit $rc
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Code Quality
@@ -53,7 +53,7 @@ coverage: dev-setup
 
 # Run copy/paste detection (jscpd); skip gracefully if npx is unavailable
 jscpd:
-    npx --yes jscpd@latest . --config .jscpd.json
+    npx --yes jscpd@5.4.0 . --config .jscpd.json
 
 # Run the full check suite: ruff format --check, ruff check, mypy, pyright, jscpd
 check: ruff-format-check ruffcheck typecheck jscpd

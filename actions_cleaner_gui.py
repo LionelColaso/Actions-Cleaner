@@ -3,12 +3,18 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import time
+from typing import Any, TypedDict, cast
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QRect, Qt, QThread, Signal
+from PySide6.QtGui import QCloseEvent, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -16,18 +22,94 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSpinBox,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
+VERSION = "0.1.0"
 
-def list_runs(repo: str, status: str | None = None) -> list[dict[str, str]]:
+#: GitHub slugs: alphanumerics plus `-`, `_`, `.` on both sides of the slash.
+REPO_PATTERN = re.compile(r"[\w.-]+/[\w.-]+")
+#: `github.com/owner/repo...` with optional scheme/`www.` — first two path
+#: segments only, so issue/PR/action URLs resolve to their repository.
+GITHUB_URL_PATTERN = re.compile(
+    r"^(?:https?://)?(?:www\.)?github\.com/([^/\s?#]+/[^/\s?#]+)",
+    re.IGNORECASE,
+)
+#: SSH clone remotes: `git@github.com:owner/repo[.git]`.
+GITHUB_SSH_PATTERN = re.compile(
+    r"^git@github\.com:([^/\s]+/[^/\s]+)$",
+    re.IGNORECASE,
+)
+
+#: Saved repositories — a bare, human-readable JSON array (AGENTS.md §4.5).
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".actions-cleaner-repos.json")
+#: Saved preferences (`keep`, `failed_only`). Dry-run is deliberately *not*
+#: persisted so the app always starts in safe dry-run mode (AGENTS.md §4.3).
+PREFERENCES_PATH = os.path.join(
+    os.path.expanduser("~"), ".actions-cleaner-settings.json"
+)
+
+GH_LIST_TIMEOUT = 60  # seconds for `gh run list`
+GH_DELETE_TIMEOUT = 60  # seconds per `gh run delete`
+GH_AUTH_TIMEOUT = 30  # seconds for `gh auth status`
+
+DRY_RUN_PROGRESS_STEP = 25  # throttle progress signals during dry runs
+LOG_MAX_BLOCKS = 5000  # cap on the log widget's line count
+
+#: Run conclusions treated as "failed" by the failed-only filter.
+FAILED_CONCLUSIONS = frozenset({"failure", "cancelled", "timed_out", "startup_failure"})
+
+
+class RunInfo(TypedDict):
+    """One workflow run as returned by `gh run list --json`."""
+
+    databaseId: int
+    headSha: str
+    createdAt: str
+    conclusion: str
+
+
+def is_valid_repo(repo: str) -> bool:
+    """Return True for a plausible GitHub `owner/repo` slug."""
+    return REPO_PATTERN.fullmatch(repo) is not None
+
+
+def normalize_repo(value: str) -> str:
+    """Return `owner/repo` from a slug, GitHub URL, or SSH remote.
+
+    Accepts plain `owner/repo` slugs unchanged, and extracts the slug from
+    forms like ``https://github.com/owner/repo`` (any scheme, optional
+    ``www.``, trailing paths such as ``/actions/runs/42``, query strings,
+    ``.git`` suffixes) and ``git@github.com:owner/repo.git``. Input that is
+    not a GitHub remote is returned unchanged (and must then pass
+    :func:`is_valid_repo`).
+    """
+    text = value.strip()
+    match = GITHUB_URL_PATTERN.match(text) or GITHUB_SSH_PATTERN.match(text)
+    if match is None:
+        return text
+    slug = match.group(1)
+    slug = slug.removesuffix(".git")
+    return slug
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Narrow a decoded-JSON value to an object (``{}`` when it isn't one)."""
+    if isinstance(value, dict):
+        return cast(dict[str, Any], value)
+    return {}
+
+
+def list_runs(repo: str) -> list[RunInfo]:
+    """Fetch the most recent workflow runs for `repo`."""
     cmd = [
         "gh",
         "run",
@@ -37,43 +119,189 @@ def list_runs(repo: str, status: str | None = None) -> list[dict[str, str]]:
         "--limit",
         "1000",
         "--json",
-        "databaseId,headSha",
+        "databaseId,headSha,createdAt,conclusion",
     ]
-    if status:
-        cmd.extend(["--status", status])
     result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         check=True,
+        timeout=GH_LIST_TIMEOUT,
     )
-    return list[dict[str, str]](json.loads(result.stdout))
+    data: Any = json.loads(result.stdout)
+    if not isinstance(data, list):
+        raise TypeError(
+            f"unexpected gh output (expected a list, got {type(data).__name__})"
+        )
+    items = cast(list[dict[str, Any]], data)
+    runs: list[RunInfo] = []
+    for item in items:
+        obj = _as_dict(item)
+        if "databaseId" not in obj or "headSha" not in obj:
+            continue
+        runs.append(
+            RunInfo(
+                databaseId=int(obj["databaseId"]),
+                headSha=str(obj["headSha"]),
+                createdAt=str(obj.get("createdAt") or ""),
+                conclusion=str(obj.get("conclusion") or ""),
+            )
+        )
+    return runs
 
 
-SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".actions-cleaner-repos.json")
+def filter_failed_runs(runs: list[RunInfo]) -> list[RunInfo]:
+    """Keep only runs whose conclusion counts as failed."""
+    return [run for run in runs if run["conclusion"] in FAILED_CONCLUSIONS]
+
+
+def select_runs_to_delete(
+    runs: list[RunInfo], keep: int
+) -> tuple[list[str], list[str]]:
+    """Split runs into ``(delete, keep)`` id lists.
+
+    Runs are ordered by ``createdAt`` (newest first) so the newest ``keep``
+    distinct head SHAs — and every run belonging to them — are preserved.
+    """
+    ordered = sorted(runs, key=lambda run: run["createdAt"], reverse=True)
+    newest_shas: list[str] = []
+    seen: set[str] = set()
+    for run in ordered:
+        sha = run["headSha"]
+        if sha not in seen:
+            seen.add(sha)
+            newest_shas.append(sha)
+    keep_shas = set(newest_shas[:keep])
+    delete_ids = [
+        str(run["databaseId"]) for run in ordered if run["headSha"] not in keep_shas
+    ]
+    kept_ids = [
+        str(run["databaseId"]) for run in ordered if run["headSha"] in keep_shas
+    ]
+    return delete_ids, kept_ids
 
 
 def load_repos() -> list[str]:
+    """Load saved repositories; tolerates bare-list and legacy dict formats."""
     if not os.path.exists(SETTINGS_PATH):
         return []
     try:
-        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return [r for r in data.get("repos", []) if isinstance(r, str)]
-    except json.JSONDecodeError, OSError:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data: Any = json.load(f)
+    except OSError, json.JSONDecodeError:
         return []
+    raw: Any
+    if isinstance(data, dict):
+        raw = _as_dict(data).get("repos", [])
+    else:
+        raw = data
+    if not isinstance(raw, list):
+        return []
+    items = cast(list[object], raw)
+    repos: list[str] = []
+    for entry in items:
+        if isinstance(entry, str) and entry and entry not in repos:
+            repos.append(entry)
+    return repos
 
 
-def save_repos(repos: list[str]) -> None:
-    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-        json.dump({"repos": repos}, f, indent=2)
+def save_repos(repos: list[str]) -> bool:
+    """Persist repositories as a bare JSON array; False on I/O failure."""
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(repos, f, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def load_preferences() -> tuple[int, bool]:
+    """Return ``(keep, failed_only)`` with safe defaults."""
+    keep = 2
+    failed_only = False
+    try:
+        with open(PREFERENCES_PATH, encoding="utf-8") as f:
+            data: Any = json.load(f)
+    except OSError, json.JSONDecodeError:
+        return keep, failed_only
+    obj = _as_dict(data)
+    raw_keep = obj.get("keep")
+    if (
+        isinstance(raw_keep, int)
+        and not isinstance(raw_keep, bool)
+        and 1 <= raw_keep <= 100
+    ):
+        keep = raw_keep
+    failed_candidate = obj.get("failed_only")
+    if isinstance(failed_candidate, bool):
+        failed_only = failed_candidate
+    return keep, failed_only
+
+
+def save_preferences(keep: int, failed_only: bool) -> bool:
+    """Persist preferences (never dry-run — see AGENTS.md §4.3)."""
+    try:
+        with open(PREFERENCES_PATH, "w", encoding="utf-8") as f:
+            json.dump({"keep": keep, "failed_only": failed_only}, f, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def delete_run(repo: str, run_id: str) -> tuple[bool, str]:
+    """Delete a single workflow run. Returns ``(success, error detail)``."""
+    try:
+        result = subprocess.run(
+            ["gh", "run", "delete", run_id, "--repo", repo],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GH_DELETE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+    except OSError as e:
+        return False, str(e)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if not detail:
+            detail = f"exit code {result.returncode}"
+        return False, detail
+    return True, ""
+
+
+def check_gh_auth() -> str:
+    """Preflight `gh`; return an error message or "" when ready to go."""
+    if shutil.which("gh") is None:
+        return (
+            "the `gh` CLI was not found on PATH (install from https://cli.github.com/)"
+        )
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GH_AUTH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return "`gh auth status` timed out"
+    except OSError as e:
+        return f"could not run `gh`: {e}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return f"`gh` is not authenticated — run `gh auth login`. {detail}".strip()
+    return ""
 
 
 class CleanupWorker(QThread):
+    """Runs all `gh` CLI work off the GUI thread (AGENTS.md §4.1)."""
+
     log_signal = Signal(str)
     max_signal = Signal(int)
     progress_signal = Signal(int)
-    finished_signal = Signal(int)
+    finished_signal = Signal(int)  # 0 success, 1 failure, 2 cancelled
+    summary_signal = Signal(int, int, int)  # kept, deleted/targeted, failed
 
     def __init__(
         self,
@@ -88,109 +316,131 @@ class CleanupWorker(QThread):
         self.keep = keep
         self.dry_run = dry_run
         self.failed_only = failed_only
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Request a stop; takes effect after the current `gh` call."""
+        self._cancelled = True
 
     def run(self) -> None:
         try:
+            self.log_signal.emit("Checking gh CLI authentication...")
+            auth_error = check_gh_auth()
+            if auth_error:
+                self.log_signal.emit(f"Error: {auth_error}")
+                self.finished_signal.emit(1)
+                return
             self.log_signal.emit(f"Fetching workflow runs for {self.repo}...")
-            status = "failure" if self.failed_only else None
-            runs = list_runs(self.repo, status=status)
+            runs = list_runs(self.repo)
+            if self.failed_only:
+                runs = filter_failed_runs(runs)
+                self.log_signal.emit(
+                    "Failed-only mode: considering failure/cancelled/timed-out runs."
+                )
         except subprocess.CalledProcessError as e:
-            self.log_signal.emit(f"Error fetching runs: {e.stderr or e}")
+            detail = (e.stderr or str(e)).strip()
+            self.log_signal.emit(f"Error fetching runs: {detail}")
+            self.finished_signal.emit(1)
+            return
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError) as e:
+            self.log_signal.emit(f"Error fetching runs: {e}")
             self.finished_signal.emit(1)
             return
 
         if not runs:
-            self.log_signal.emit("No workflow runs found.")
+            self.log_signal.emit("No matching workflow runs found.")
+            self.summary_signal.emit(0, 0, 0)
             self.finished_signal.emit(0)
             return
 
-        commits: list[str] = []
-        seen: set[str] = set()
-        for run in runs:
-            sha = run["headSha"]
-            if sha not in seen:
-                commits.append(sha)
-                seen.add(sha)
+        delete_ids, kept_ids = select_runs_to_delete(runs, self.keep)
+        kept = len(kept_ids)
+        total = len(delete_ids)
 
-        keep_commits = set(commits[: self.keep])
-        delete_runs: list[str] = []
-
-        for run in runs:
-            if run["headSha"] not in keep_commits:
-                delete_runs.append(str(run["databaseId"]))
-
-        keep_runs = len(runs) - len(delete_runs)
-        action = "Would delete" if self.dry_run else "Deleting"
-        self.log_signal.emit(
-            f"{action} {len(delete_runs)} runs, keeping {keep_runs} from latest {self.keep} commits."
-        )
-
-        total = len(delete_runs)
-        self.max_signal.emit(total)
-        if self.dry_run:
-            for i, run_id in enumerate(delete_runs, 1):
-                self.progress_signal.emit(i)
-                self.log_signal.emit(f"  DRY-RUN: would delete run {run_id}")
-        else:
-            status_file = os.path.join(
-                os.environ.get("TMPDIR", ""), f"actions-cleaner-status-{id(self)}.txt"
+        if total == 0:
+            self.log_signal.emit(
+                f"Nothing to delete — all {kept} run(s) belong to the "
+                f"latest {self.keep} commit(s)."
             )
-            if not status_file:
-                status_file = os.path.join(
-                    os.environ.get("TEMP", ""), f"actions-cleaner-status-{id(self)}.txt"
-                )
-            lines: list[str] = []
-            for run_id in delete_runs:
-                lines.append(f'echo "{run_id}" > "{status_file}"')
-                lines.append(f'echo "DELETING:{run_id}"')
-                lines.append(
-                    f"gh run delete {run_id} --repo {self.repo} || "
-                    f'echo "FAILED:{run_id}:$?" >&2'
-                )
-            script = "\n".join(lines)
-            try:
-                result = subprocess.run(
-                    script,
-                    shell=True,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                failures: list[str] = []
-                for i, line in enumerate(result.stdout.splitlines(), 1):
-                    self.progress_signal.emit(i)
-                    if line.startswith("DELETING:"):
-                        run_id = line.split(":", 1)[1]
-                        self.log_signal.emit(f"  Deleted run {run_id}")
-                for line in result.stderr.splitlines():
-                    if line.startswith("FAILED:"):
-                        run_id = line.split(":", 2)[1]
-                        failures.append(run_id)
-                        self.log_signal.emit(f"  Failed to delete run {line}")
-                    else:
-                        self.log_signal.emit(f"  {line}")
-                if failures:
-                    self.log_signal.emit(
-                        f"Batch complete with {len(failures)} failure(s)."
-                    )
-            except (OSError, subprocess.SubprocessError) as e:
-                self.log_signal.emit(f"  Batch delete error: {e}")
-            finally:
-                try:
-                    os.remove(status_file)
-                except OSError:
-                    pass
+        else:
+            action = "Would delete" if self.dry_run else "Deleting"
+            self.log_signal.emit(
+                f"{action} {total} run(s), keeping {kept} from the "
+                f"latest {self.keep} commit(s)."
+            )
 
+        self.max_signal.emit(max(total, 1))
+        done = 0
+        failed = 0
+        if self.dry_run:
+            for run_id in delete_ids:
+                if self._cancelled:
+                    break
+                done += 1
+                self.log_signal.emit(f"  DRY-RUN: would delete run {run_id}")
+                if done % DRY_RUN_PROGRESS_STEP == 0 or done == total:
+                    self.progress_signal.emit(done)
+        else:
+            for run_id in delete_ids:
+                if self._cancelled:
+                    break
+                ok, detail = delete_run(self.repo, run_id)
+                done += 1
+                if ok:
+                    self.log_signal.emit(f"  Deleted run {run_id}")
+                else:
+                    failed += 1
+                    self.log_signal.emit(f"  Failed to delete run {run_id}: {detail}")
+                self.progress_signal.emit(done)
+
+        self.summary_signal.emit(kept, done - failed, failed)
+        if self._cancelled:
+            self.log_signal.emit("Cleanup cancelled.")
+            self.finished_signal.emit(2)
+            return
+        if failed:
+            self.log_signal.emit(f"Cleanup finished with {failed} failure(s).")
+            self.finished_signal.emit(1)
+            return
         self.log_signal.emit("Cleanup complete.")
         self.finished_signal.emit(0)
+
+
+def build_window_icon() -> QIcon:
+    """Draw a simple trash-can icon (no external assets needed)."""
+    pixmap = QPixmap(64, 64)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(QColor(70, 70, 70), 5))
+    painter.drawLine(24, 11, 40, 11)
+    painter.drawLine(17, 19, 47, 19)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(200, 65, 60))
+    painter.drawRoundedRect(QRect(20, 23, 24, 31), 3, 3)
+    painter.setBrush(QColor(245, 245, 245))
+    painter.drawRect(QRect(26, 28, 4, 20))
+    painter.drawRect(QRect(34, 28, 4, 20))
+    painter.end()
+    return QIcon(pixmap)
 
 
 class MainWindow(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("GitHub Actions Cleaner")
-        self.setup_ui()
+        self.setWindowTitle(f"GitHub Actions Cleaner {VERSION}")
+        self.setWindowIcon(build_window_icon())
         self.worker: CleanupWorker | None = None
+        self._close_pending = False
+        self._repos: list[str] = load_repos()
+        self._run_started = 0.0
+        self._last_dry_run = True
+        self._last_summary = (0, 0, 0)
+        self.setup_ui()
+        keep, failed_only = load_preferences()
+        self.keep_spin.setValue(keep)
+        self.failed_only_check.setChecked(failed_only)
+        self._refresh_cleanup_enabled()
 
     def setup_ui(self) -> None:
         form = QGroupBox("Settings")
@@ -198,10 +448,18 @@ class MainWindow(QWidget):
 
         repo_row = QHBoxLayout()
         self.repo_input = QLineEdit()
-        self.repo_input.setPlaceholderText("e.g. LionelColaso/llama_gui")
+        self.repo_input.setPlaceholderText(
+            "owner/repo or https://github.com/owner/repo"
+        )
+        self.repo_input.setToolTip(
+            "GitHub repository — owner/repo slug or a GitHub URL"
+        )
+        self.repo_input.textChanged.connect(self._refresh_cleanup_enabled)
         self.add_repo_btn = QPushButton("Add")
+        self.add_repo_btn.setToolTip("Save the repository above to the list")
         self.add_repo_btn.clicked.connect(self.add_repo)
         self.remove_repo_btn = QPushButton("Remove")
+        self.remove_repo_btn.setToolTip("Remove the repository above from the list")
         self.remove_repo_btn.clicked.connect(self.remove_repo)
         repo_row.addWidget(self.repo_input)
         repo_row.addWidget(self.add_repo_btn)
@@ -210,20 +468,24 @@ class MainWindow(QWidget):
 
         self.repo_combo = QComboBox()
         self.repo_combo.setEditable(False)
+        self.repo_combo.setToolTip(
+            "Saved repositories — selecting one loads it above for edit/remove"
+        )
         self.load_repo_list()
         form_layout.addRow("Saved repositories:", self.repo_combo)
         self.repo_combo.currentTextChanged.connect(self.on_repo_selected)
 
         self.keep_spin = QSpinBox()
-        self.keep_spin.setRange(1, 1000)
+        self.keep_spin.setRange(1, 100)
         self.keep_spin.setValue(2)
-        form_layout.addRow("Runs to keep:", self.keep_spin)
+        self.keep_spin.setToolTip("How many newest commits' runs to preserve")
+        form_layout.addRow("Commits to keep:", self.keep_spin)
 
         self.dry_run_check = QCheckBox("Dry run (don't actually delete)")
         self.dry_run_check.setChecked(True)
         form_layout.addRow("", self.dry_run_check)
 
-        self.failed_only_check = QCheckBox("Failed workflows only")
+        self.failed_only_check = QCheckBox("Failed / cancelled only")
         form_layout.addRow("", self.failed_only_check)
 
         form.setLayout(form_layout)
@@ -231,49 +493,72 @@ class MainWindow(QWidget):
         self.cleanup_btn = QPushButton("Clean Up Actions")
         self.cleanup_btn.clicked.connect(self.start_cleanup)
 
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.clicked.connect(self.cancel_cleanup)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
 
-        self.log_output = QTextEdit()
+        self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
+        self.log_output.setMaximumBlockCount(LOG_MAX_BLOCKS)
+
+        self.summary_label = QLabel()
+        self.summary_label.setVisible(False)
 
         layout = QVBoxLayout()
         layout.addWidget(form)
-        layout.addWidget(self.cleanup_btn)
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.cleanup_btn)
+        button_row.addWidget(self.cancel_btn)
+        layout.addLayout(button_row)
         layout.addWidget(self.progress_bar)
         layout.addWidget(self.log_output)
+        layout.addWidget(self.summary_label)
         self.setLayout(layout)
 
+    def _refresh_cleanup_enabled(self) -> None:
+        busy = self.worker is not None
+        has_repo = bool(self.repo_input.text().strip())
+        self.cleanup_btn.setEnabled(not busy and has_repo)
+
     def load_repo_list(self) -> None:
-        repos = load_repos()
-        self.repo_combo.clear()
-        self.repo_combo.addItems(repos)
-        if repos:
-            self.repo_input.setText(repos[0])
+        """Repopulate the combo without firing selection signals."""
+        self.repo_combo.blockSignals(True)
+        try:
+            self.repo_combo.clear()
+            self.repo_combo.addItems(self._repos)
+        finally:
+            self.repo_combo.blockSignals(False)
 
     def on_repo_selected(self, text: str) -> None:
-        self.repo_input.setText(text)
+        if text:
+            self.repo_input.setText(text)
 
     def add_repo(self) -> None:
-        repo = self.repo_input.text().strip()
-        if not repo:
+        repo = normalize_repo(self.repo_input.text())
+        if not is_valid_repo(repo):
             QMessageBox.warning(
                 self,
                 "Validation Error",
-                "Please enter a repository name (e.g. owner/repo).",
+                "Please enter a repository as owner/repo or a GitHub URL.",
             )
             return
-        repos = load_repos()
-        if repo in repos:
+        if repo in self._repos:
             QMessageBox.information(self, "Info", "Repository already exists.")
             return
-        repos.append(repo)
-        save_repos(repos)
+        self._repos.append(repo)
+        if not save_repos(self._repos):
+            self._repos.pop()
+            QMessageBox.critical(self, "Error", f"Could not write {SETTINGS_PATH}")
+            return
+        self.repo_input.setText(repo)  # show the canonical owner/repo form
         self.load_repo_list()
         self.repo_combo.setCurrentText(repo)
 
     def remove_repo(self) -> None:
-        repo = self.repo_input.text().strip()
+        repo = normalize_repo(self.repo_input.text())
         if not repo:
             QMessageBox.warning(
                 self,
@@ -281,67 +566,194 @@ class MainWindow(QWidget):
                 "Please enter or select a repository to remove.",
             )
             return
-        repos = load_repos()
-        if repo not in repos:
+        if repo not in self._repos:
             QMessageBox.information(self, "Info", "Repository not found in saved list.")
             return
-        repos.remove(repo)
-        save_repos(repos)
+        index = self._repos.index(repo)
+        self._repos.remove(repo)
+        if not save_repos(self._repos):
+            self._repos.insert(index, repo)
+            QMessageBox.critical(self, "Error", f"Could not write {SETTINGS_PATH}")
+            return
         self.load_repo_list()
-        if repos:
-            self.repo_input.setText(repos[0])
+        self.repo_input.setText(self._repos[0] if self._repos else "")
 
     def start_cleanup(self) -> None:
-        repo = self.repo_input.text().strip()
-        if not repo:
+        repo = normalize_repo(self.repo_input.text())
+        if not is_valid_repo(repo):
             QMessageBox.warning(
-                self, "Validation Error", "Please enter a repository (e.g. owner/repo)."
+                self,
+                "Validation Error",
+                "Please enter a repository as owner/repo or a GitHub URL.",
             )
             return
+        if self.repo_input.text().strip() != repo:
+            self.repo_input.setText(repo)  # keep the canonical slug visible
+        if shutil.which("gh") is None:
+            QMessageBox.warning(
+                self,
+                "Missing Dependency",
+                "The `gh` CLI was not found on PATH.\n"
+                "Install it from https://cli.github.com/ and run `gh auth login`.",
+            )
+            return
+        if self.worker is not None:
+            return
 
-        keep = self.keep_spin.value()
         dry_run = self.dry_run_check.isChecked()
-        failed_only = self.failed_only_check.isChecked()
-
-        self.cleanup_btn.setEnabled(False)
+        self._last_dry_run = dry_run
+        self._run_started = time.monotonic()
+        self._last_summary = (0, 0, 0)
         self.log_output.clear()
+        self.summary_label.setVisible(False)
+        if not save_preferences(
+            self.keep_spin.value(), self.failed_only_check.isChecked()
+        ):
+            self.log_output.appendPlainText(
+                f"Warning: could not write {PREFERENCES_PATH}"
+            )
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
+        self.cancel_btn.setVisible(True)
+        self.cancel_btn.setEnabled(True)
 
-        self.worker = CleanupWorker(repo, keep, dry_run, failed_only)
-        self.worker.log_signal.connect(self.log_output.append)
+        self.worker = CleanupWorker(
+            repo,
+            self.keep_spin.value(),
+            dry_run,
+            self.failed_only_check.isChecked(),
+        )
+        self.worker.log_signal.connect(self.log_output.appendPlainText)
         self.worker.max_signal.connect(self.progress_bar.setMaximum)
         self.worker.progress_signal.connect(self.progress_bar.setValue)
+        self.worker.summary_signal.connect(self.on_summary)
         self.worker.finished_signal.connect(self.on_cleanup_finished)
+        self.worker.finished.connect(self.on_thread_finished)
         self.worker.start()
+        self._refresh_cleanup_enabled()
+
+    def cancel_cleanup(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            self.cancel_btn.setEnabled(False)
+            self.log_output.appendPlainText(
+                "Cancelling — waiting for the current operation to finish..."
+            )
+
+    def on_summary(self, kept: int, deleted: int, failed: int) -> None:
+        self._last_summary = (kept, deleted, failed)
 
     def on_cleanup_finished(self, result: int) -> None:
-        self.cleanup_btn.setEnabled(True)
-        if result != 0:
-            QMessageBox.critical(
-                self, "Error", "Cleanup failed. Check the log for details."
+        """Reset UI state and report the outcome (0 ok, 1 fail, 2 cancel)."""
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self._refresh_cleanup_enabled()
+
+        kept, deleted, failed = self._last_summary
+        elapsed = time.monotonic() - self._run_started if self._run_started else 0.0
+        if self._last_dry_run:
+            state = "Dry run"
+        elif result == 2:
+            state = "Cancelled"
+        elif result != 0:
+            state = "Failed"
+        else:
+            state = "Done"
+        self.summary_label.setText(
+            f"{state} · kept {kept} · deleted {deleted} · "
+            f"failed {failed} · {elapsed:.1f}s"
+        )
+        self.summary_label.setVisible(True)
+
+        if self._close_pending:
+            return  # window is closing — don't stack dialogs on the way out
+        if result == 0:
+            if self._last_dry_run:
+                message = (
+                    f"Dry run complete: would delete {deleted} run(s), "
+                    f"keeping {kept} ({elapsed:.1f}s)."
+                )
+            else:
+                message = (
+                    f"Cleanup completed: deleted {deleted} run(s), "
+                    f"keeping {kept} ({elapsed:.1f}s)."
+                )
+            QMessageBox.information(self, "Success", message)
+        elif result == 2:
+            QMessageBox.information(
+                self,
+                "Cancelled",
+                f"Cleanup cancelled after {elapsed:.1f}s ({deleted} run(s) processed).",
             )
         else:
-            QMessageBox.information(self, "Success", "Cleanup completed successfully.")
+            QMessageBox.critical(
+                self,
+                "Error",
+                "Cleanup failed. Check the log for details.\n"
+                f"({deleted} deleted, {failed} failed, {kept} kept)",
+            )
+
+    def on_thread_finished(self) -> None:
+        """Worker thread fully stopped — release it and honour pending close."""
+        worker = self.worker
+        self.worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self._refresh_cleanup_enabled()
+        if self._close_pending:
+            self.close()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            # Never destroy a running QThread; cancel and close once it ends.
+            self._close_pending = True
+            self.worker.cancel()
+            self.log_output.appendPlainText(
+                "Closing — waiting for the running cleanup to stop..."
+            )
+            event.ignore()
+            return
+        event.accept()
+
+
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="actions-cleaner",
+        description=(
+            "Clean up GitHub Actions workflow runs by keeping only the "
+            "latest N commits' runs."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"actions-cleaner {VERSION}",
+    )
+    return parser
 
 
 def main() -> int:
-    if "--help" in sys.argv or "-h" in sys.argv:
-        print("Usage: actions-cleaner [OPTIONS]")
-        print("Clean up GitHub Actions workflow runs.")
-        print()
-        print("Options:")
-        print("  -h, --help     Show this message and exit")
-        print("  --version      Show the version and exit")
-        return 0
-
-    if "--version" in sys.argv:
-        print("actions-cleaner 0.1.0")
+    # The standalone build may run with --windows-console-mode=disable,
+    # where stdio handles don't exist; fall back to devnull so --help and
+    # --version still exit cleanly instead of raising.
+    if sys.stdout is None:
+        sys.stdout = open(  # noqa: SIM115 — must outlive main()
+            os.devnull, "w", encoding="utf-8"
+        )
+    if sys.stderr is None:
+        sys.stderr = open(  # noqa: SIM115 — must outlive main()
+            os.devnull, "w", encoding="utf-8"
+        )
+    try:
+        make_parser().parse_args()
+    except OSError:
         return 0
 
     app = QApplication(sys.argv)
     window = MainWindow()
-    window.resize(600, 400)
+    window.resize(640, 520)
     window.show()
     return app.exec()
 
