@@ -1,6 +1,10 @@
 name: Lint
 
 # Reusable only — called by ci.yml (PRs) and auto_build.yml (pushes to main).
+# Ruff is pure syntax/style analysis: it never resolves imports or reads
+# platform stubs, so its output is identical on every OS — one runner.
+# (Mypy lives in mypy.yml as a 3-OS matrix, a separate job so a format
+# failure cannot skip the type check.)
 on:
   workflow_call:
   workflow_dispatch:
@@ -25,5 +29,3 @@ jobs:
       - name: Ruff check
         run: uv run ruff check .
 
-      - name: Mypy
-        run: uv run mypy .
