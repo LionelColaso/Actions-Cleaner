@@ -1,11 +1,9 @@
-# Auto build on push to main and pull_request.
-# Pushes to main also create an Edge release on GitHub.
+# Auto build on push to main and create an Edge release.
+# Pull requests are covered by ci.yml (lint + mypy + pyright + pytest + build).
 
 name: Auto Build
 
 on:
-  pull_request:
-    types: [opened, synchronize]
   push:
     branches:
       - main
@@ -18,6 +16,11 @@ jobs:
       contents: read
     uses: ./.github/workflows/lint.yml
 
+  pre-mypy:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/mypy.yml
+
   pre-pyright:
     permissions:
       contents: read
@@ -29,21 +32,21 @@ jobs:
     uses: ./.github/workflows/pytest.yml
 
   build:
-    needs: [pre-lint, pre-pyright, pre-test]
+    needs: [pre-lint, pre-mypy, pre-pyright, pre-test]
     permissions:
       id-token: write
       contents: read
       attestations: write
     uses: ./.github/workflows/build.yml
     with:
-      attest: ${{ github.event_name == 'push' }}
+      attest: true
 
   edge-release:
     needs: [build, pre-lint, pre-pyright, pre-test]
     if: >-
-      github.event_name == 'push'
-      && needs.build.result == 'success'
+      needs.build.result == 'success'
       && needs.pre-lint.result == 'success'
+      && needs.pre-mypy.result == 'success'
       && needs.pre-pyright.result == 'success'
       && needs.pre-test.result == 'success'
     permissions:

@@ -1,15 +1,15 @@
-name: Pyright
+name: Mypy
 
 # Reusable only — called by ci.yml (PRs) and auto_build.yml (pushes to main).
+# Mypy resolves real platform stubs (PySide6 ships per-OS wheels, and
+# sys.platform branches narrow differently), so it runs on all 3 OSes.
 on:
   workflow_call:
   workflow_dispatch:
 
 jobs:
-  # Pyright resolves real platform stubs (PySide6 ships per-OS wheels, and
-  # sys.platform branches narrow differently), so it runs on all 3 OSes.
-  pyright:
-    name: pyright / ${{ matrix.os }}
+  mypy:
+    name: mypy / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -26,5 +26,5 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked --dev
 
-      - name: Pyright
-        run: uv run pyright -p pyproject.toml .
+      - name: Mypy
+        run: uv run mypy .
