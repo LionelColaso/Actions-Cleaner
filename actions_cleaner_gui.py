@@ -120,12 +120,17 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
-def list_runs(repo: str, fetch_limit: int = FETCH_LIMIT_DEFAULT) -> list[RunInfo]:
+def list_runs(
+    repo: str,
+    fetch_limit: int = FETCH_LIMIT_DEFAULT,
+    workflow: str = "",
+) -> list[RunInfo]:
     """Fetch up to `fetch_limit` most-recent workflow runs for `repo`.
 
     ``gh run list --limit N`` means "maximum number of runs to fetch" and
     pages the REST API internally (100 runs/page), so raising the limit needs
-    no manual pagination code on our side.
+    no manual pagination code on our side. When `workflow` is non-empty the
+    ``--workflow`` flag narrows the fetch to a single workflow name or ID.
     """
     limit = max(FETCH_LIMIT_MIN, min(fetch_limit, FETCH_LIMIT_MAX))
     cmd = [
@@ -139,6 +144,8 @@ def list_runs(repo: str, fetch_limit: int = FETCH_LIMIT_DEFAULT) -> list[RunInfo
         "--json",
         "databaseId,headSha,createdAt,conclusion",
     ]
+    if workflow:
+        cmd.extend(["--workflow", workflow])
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -233,17 +240,18 @@ def save_repos(repos: list[str]) -> bool:
         return False
 
 
-def load_preferences() -> tuple[int, bool, int, int]:
-    """Return ``(keep, failed_only, fetch_limit, max_deletions)`` safely."""
+def load_preferences() -> tuple[int, bool, int, int, str]:
+    """Return ``(keep, failed_only, fetch_limit, max_deletions, last_repo)``."""
     keep = 2
     failed_only = False
     fetch_limit = FETCH_LIMIT_DEFAULT
     max_deletions = MAX_DELETIONS_MIN
+    last_repo = ""
     try:
         with open(PREFERENCES_PATH, encoding="utf-8") as f:
             data: Any = json.load(f)
     except OSError, json.JSONDecodeError:
-        return keep, failed_only, fetch_limit, max_deletions
+        return keep, failed_only, fetch_limit, max_deletions, last_repo
     obj = _as_dict(data)
     raw_keep = obj.get("keep")
     if (
@@ -269,7 +277,10 @@ def load_preferences() -> tuple[int, bool, int, int]:
         and MAX_DELETIONS_MIN <= raw_max_del <= MAX_DELETIONS_MAX
     ):
         max_deletions = raw_max_del
-    return keep, failed_only, fetch_limit, max_deletions
+    raw_last_repo = obj.get("last_repo")
+    if isinstance(raw_last_repo, str) and is_valid_repo(raw_last_repo):
+        last_repo = raw_last_repo
+    return keep, failed_only, fetch_limit, max_deletions, last_repo
 
 
 def save_preferences(
@@ -277,6 +288,7 @@ def save_preferences(
     failed_only: bool,
     fetch_limit: int = FETCH_LIMIT_DEFAULT,
     max_deletions: int = MAX_DELETIONS_MIN,
+    last_repo: str = "",
 ) -> bool:
     """Persist preferences (never dry-run — see AGENTS.md §4.3)."""
     try:
@@ -287,6 +299,7 @@ def save_preferences(
                     "failed_only": failed_only,
                     "fetch_limit": fetch_limit,
                     "max_deletions": max_deletions,
+                    "last_repo": last_repo,
                 },
                 f,
                 indent=2,
@@ -359,6 +372,7 @@ class CleanupWorker(QThread):
         failed_only: bool = False,
         fetch_limit: int = FETCH_LIMIT_DEFAULT,
         max_deletions: int = MAX_DELETIONS_MIN,
+        workflow: str = "",
         parent: QObject | None = None,
     ):
         super().__init__(parent)
@@ -369,6 +383,8 @@ class CleanupWorker(QThread):
         self.fetch_limit = max(FETCH_LIMIT_MIN, min(fetch_limit, FETCH_LIMIT_MAX))
         # 0 (or negative) means "no cap".
         self.max_deletions = max(0, max_deletions)
+        # Empty string means "all workflows"; non-empty narrows the fetch.
+        self.workflow = workflow.strip()
         self._cancelled = False
         self._pause_gate = threading.Event()
         self._pause_gate.set()  # set == running, cleared == paused
@@ -408,7 +424,9 @@ class CleanupWorker(QThread):
                 self.finished_signal.emit(1)
                 return
             self.log_signal.emit(f"Fetching workflow runs for {self.repo}...")
-            runs = list_runs(self.repo, self.fetch_limit)
+            if self.workflow:
+                self.log_signal.emit(f"  (filtered to workflow: {self.workflow})")
+            runs = list_runs(self.repo, self.fetch_limit, self.workflow)
             if self.failed_only:
                 runs = filter_failed_runs(runs)
                 self.log_signal.emit(
@@ -557,11 +575,13 @@ class MainWindow(QWidget):
         self._last_dry_run = True
         self._last_summary = (0, 0, 0)
         self.setup_ui()
-        keep, failed_only, fetch_limit, max_deletions = load_preferences()
+        keep, failed_only, fetch_limit, max_deletions, last_repo = load_preferences()
         self.keep_spin.setValue(keep)
         self.failed_only_check.setChecked(failed_only)
         self.fetch_limit_spin.setValue(fetch_limit)
         self.max_deletions_spin.setValue(max_deletions)
+        if last_repo:
+            self.repo_input.setText(last_repo)
         self._refresh_cleanup_enabled()
 
     def setup_ui(self) -> None:
@@ -628,6 +648,16 @@ class MainWindow(QWidget):
 
         self.failed_only_check = QCheckBox("Failed / cancelled only")
         form_layout.addRow("", self.failed_only_check)
+
+        self.workflow_input = QLineEdit()
+        self.workflow_input.setPlaceholderText(
+            "workflow name or ID (optional, leave blank for all)"
+        )
+        self.workflow_input.setToolTip(
+            "Restrict cleanup to one workflow by name or ID "
+            "(e.g. 'ci.yml' or '12345678-abcd-...')"
+        )
+        form_layout.addRow("Workflow filter:", self.workflow_input)
 
         form.setLayout(form_layout)
 
@@ -757,6 +787,7 @@ class MainWindow(QWidget):
             self.failed_only_check.isChecked(),
             self.fetch_limit_spin.value(),
             self.max_deletions_spin.value(),
+            repo,
         ):
             self.log_output.appendPlainText(
                 f"Warning: could not write {PREFERENCES_PATH}"
@@ -777,6 +808,7 @@ class MainWindow(QWidget):
             self.failed_only_check.isChecked(),
             fetch_limit=self.fetch_limit_spin.value(),
             max_deletions=self.max_deletions_spin.value(),
+            workflow=self.workflow_input.text(),
         )
         self.worker.log_signal.connect(self.log_output.appendPlainText)
         self.worker.max_signal.connect(self.progress_bar.setMaximum)

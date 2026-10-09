@@ -39,15 +39,19 @@ class _GhMock:
         self.delete_detail = ""
         self.delete_calls: list[str] = []
         self.list_fetch_limit = 0
+        self.list_workflow = ""
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_auth() -> str:
             return self.auth_error
 
-        def fake_list(repo: str, fetch_limit: int = 0) -> list[app.RunInfo]:
+        def fake_list(
+            repo: str, fetch_limit: int = 0, workflow: str = ""
+        ) -> list[app.RunInfo]:
             if self.list_error is not None:
                 raise self.list_error
             self.list_fetch_limit = fetch_limit
+            self.list_workflow = workflow
             return list(self.runs)
 
         def fake_delete(repo: str, run_id: str) -> tuple[bool, str]:

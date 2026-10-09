@@ -359,6 +359,7 @@ def test_start_cleanup_full_lifecycle(
         "failed_only": False,
         "fetch_limit": app.FETCH_LIMIT_DEFAULT,
         "max_deletions": 0,
+        "last_repo": "owner/repo",
     }
     window.close()
 

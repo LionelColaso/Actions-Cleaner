@@ -138,12 +138,19 @@ def test_save_repos_failure_returns_false(
 def test_load_preferences_defaults(
     settings_paths: tuple[Path, Path],
 ) -> None:
-    assert app.load_preferences() == (2, False, app.FETCH_LIMIT_DEFAULT, 0)
+    assert app.load_preferences() == (2, False, app.FETCH_LIMIT_DEFAULT, 0, "")
 
 
 def test_preferences_roundtrip(settings_paths: tuple[Path, Path]) -> None:
     assert app.save_preferences(7, True, 500, 25)
-    assert app.load_preferences() == (7, True, 500, 25)
+    assert app.load_preferences() == (7, True, 500, 25, "")
+
+
+def test_preferences_roundtrip_with_last_repo(
+    settings_paths: tuple[Path, Path],
+) -> None:
+    assert app.save_preferences(7, True, 500, 25, "owner/repo")
+    assert app.load_preferences() == (7, True, 500, 25, "owner/repo")
 
 
 def test_preferences_roundtrip_uses_defaults_for_new_fields(
@@ -156,6 +163,7 @@ def test_preferences_roundtrip_uses_defaults_for_new_fields(
         True,
         app.FETCH_LIMIT_DEFAULT,
         0,
+        "",
     )
 
 
@@ -164,14 +172,14 @@ def test_load_preferences_corrupt_json(
 ) -> None:
     _, prefs_path = settings_paths
     _write(prefs_path, "nope")
-    assert app.load_preferences() == (2, False, app.FETCH_LIMIT_DEFAULT, 0)
+    assert app.load_preferences() == (2, False, app.FETCH_LIMIT_DEFAULT, 0, "")
 
 
 def test_load_preferences_rejects_bad_values(
     settings_paths: tuple[Path, Path],
 ) -> None:
     _, prefs_path = settings_paths
-    default = (2, False, app.FETCH_LIMIT_DEFAULT, 0)
+    default = (2, False, app.FETCH_LIMIT_DEFAULT, 0, "")
     _write(
         prefs_path,
         json.dumps({"keep": 0, "failed_only": "yes"}),
@@ -222,10 +230,23 @@ def test_load_preferences_accepts_valid_new_fields(
         False,
         app.FETCH_LIMIT_MAX,
         app.MAX_DELETIONS_MAX,
+        "",
     )
     # 0 deletions and the minimum fetch limit are both accepted.
     _write(prefs_path, json.dumps({"fetch_limit": app.FETCH_LIMIT_MIN}))
     assert app.load_preferences()[2] == app.FETCH_LIMIT_MIN
+
+
+def test_load_preferences_rejects_invalid_last_repo(
+    settings_paths: tuple[Path, Path],
+) -> None:
+    _, prefs_path = settings_paths
+    _write(prefs_path, json.dumps({"last_repo": "not-a-valid-repo"}))
+    assert app.load_preferences()[4] == ""
+    _write(prefs_path, json.dumps({"last_repo": 12345}))
+    assert app.load_preferences()[4] == ""
+    _write(prefs_path, json.dumps({"last_repo": "owner/repo"}))
+    assert app.load_preferences()[4] == "owner/repo"
 
 
 def test_save_preferences_failure_returns_false(
