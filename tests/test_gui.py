@@ -418,3 +418,33 @@ def test_new_option_spin_boxes_exist_with_defaults() -> None:
     assert window.fetch_limit_spin.minimum() == app.FETCH_LIMIT_MIN
     assert window.fetch_limit_spin.maximum() == app.FETCH_LIMIT_MAX
     window.close()
+
+
+def test_find_icon_file_returns_packaged_asset() -> None:
+    """The designed icon asset is found in the dev checkout."""
+    icon = app.find_icon_file()
+    assert icon is not None
+    assert icon.is_file()
+    assert icon.name in ("icon.ico", "icon.png")
+    assert icon.parent == app.ASSETS_DIR
+
+
+def test_load_app_icon_uses_designed_asset_not_fallback() -> None:
+    """load_app_icon returns the designed icon, not the programmatic fallback."""
+    designed = app.load_app_icon()
+    fallback = app.build_window_icon()
+    assert not designed.isNull()
+    assert not fallback.isNull()
+    # The designed icon (from ICO/PNG) has more sizes than the single 64x64
+    # pixmap the fallback draws.
+    assert len(designed.availableSizes()) > len(fallback.availableSizes())
+
+
+def test_main_window_sets_designed_icon() -> None:
+    """MainWindow.__init__ sets the designed icon on the window."""
+    window = app.MainWindow()
+    icon = window.windowIcon()
+    assert not icon.isNull()
+    # The designed asset has multiple sizes; the fallback has one.
+    assert len(icon.availableSizes()) > 1
+    window.close()
