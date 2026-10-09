@@ -405,6 +405,11 @@ def delete_run(
     return True, ""
 
 
+def _delete_one(repo: str, run_id: str, timeout: int) -> tuple[bool, str]:
+    """Module-level helper for ThreadPoolExecutor.map (avoids lambda typing)."""
+    return delete_run(repo, run_id, timeout)
+
+
 def check_gh_auth(timeout: int = GH_AUTH_TIMEOUT) -> str:
     """Preflight `gh`; return an error message or "" when ready to go."""
     if shutil.which("gh") is None:
@@ -596,7 +601,6 @@ class CleanupWorker(QThread):
             from concurrent.futures import ThreadPoolExecutor
 
             batch_size = self.concurrency
-            delete_timeout = self.delete_timeout  # capture for the lambda
             for start in range(0, total, batch_size):
                 if self._cancelled:
                     break
@@ -606,8 +610,10 @@ class CleanupWorker(QThread):
                 with ThreadPoolExecutor(max_workers=batch_size) as executor:
                     results = list(
                         executor.map(
-                            lambda rid: delete_run(self.repo, rid, delete_timeout),
+                            _delete_one,
+                            [self.repo] * len(batch),
                             batch,
+                            [self.delete_timeout] * len(batch),
                         )
                     )
                 for run_id, (ok, detail) in zip(batch, results):
