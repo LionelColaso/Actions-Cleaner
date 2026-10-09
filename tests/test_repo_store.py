@@ -139,14 +139,30 @@ def test_load_preferences_defaults(
     settings_paths: tuple[Path, Path],
 ) -> None:
     assert app.load_preferences() == (
-        2, False, app.FETCH_LIMIT_DEFAULT, 0, "", app.CONCURRENCY_DEFAULT
+        2,
+        False,
+        app.FETCH_LIMIT_DEFAULT,
+        0,
+        "",
+        app.CONCURRENCY_DEFAULT,
+        app.TIMEOUT_LIST_DEFAULT,
+        app.TIMEOUT_DELETE_DEFAULT,
+        app.TIMEOUT_AUTH_DEFAULT,
     )
 
 
 def test_preferences_roundtrip(settings_paths: tuple[Path, Path]) -> None:
     assert app.save_preferences(7, True, 500, 25)
     assert app.load_preferences() == (
-        7, True, 500, 25, "", app.CONCURRENCY_DEFAULT
+        7,
+        True,
+        500,
+        25,
+        "",
+        app.CONCURRENCY_DEFAULT,
+        app.TIMEOUT_LIST_DEFAULT,
+        app.TIMEOUT_DELETE_DEFAULT,
+        app.TIMEOUT_AUTH_DEFAULT,
     )
 
 
@@ -155,7 +171,15 @@ def test_preferences_roundtrip_with_last_repo(
 ) -> None:
     assert app.save_preferences(7, True, 500, 25, "owner/repo")
     assert app.load_preferences() == (
-        7, True, 500, 25, "owner/repo", app.CONCURRENCY_DEFAULT
+        7,
+        True,
+        500,
+        25,
+        "owner/repo",
+        app.CONCURRENCY_DEFAULT,
+        app.TIMEOUT_LIST_DEFAULT,
+        app.TIMEOUT_DELETE_DEFAULT,
+        app.TIMEOUT_AUTH_DEFAULT,
     )
 
 
@@ -163,7 +187,26 @@ def test_preferences_roundtrip_with_concurrency(
     settings_paths: tuple[Path, Path],
 ) -> None:
     assert app.save_preferences(7, True, 500, 25, "owner/repo", 8)
-    assert app.load_preferences() == (7, True, 500, 25, "owner/repo", 8)
+    assert app.load_preferences() == (
+        7,
+        True,
+        500,
+        25,
+        "owner/repo",
+        8,
+        app.TIMEOUT_LIST_DEFAULT,
+        app.TIMEOUT_DELETE_DEFAULT,
+        app.TIMEOUT_AUTH_DEFAULT,
+    )
+
+
+def test_preferences_roundtrip_with_timeouts(
+    settings_paths: tuple[Path, Path],
+) -> None:
+    assert app.save_preferences(
+        7, True, 500, 25, "owner/repo", 8, 120, 90, 45
+    )
+    assert app.load_preferences() == (7, True, 500, 25, "owner/repo", 8, 120, 90, 45)
 
 
 def test_preferences_roundtrip_uses_defaults_for_new_fields(
@@ -178,6 +221,9 @@ def test_preferences_roundtrip_uses_defaults_for_new_fields(
         0,
         "",
         app.CONCURRENCY_DEFAULT,
+        app.TIMEOUT_LIST_DEFAULT,
+        app.TIMEOUT_DELETE_DEFAULT,
+        app.TIMEOUT_AUTH_DEFAULT,
     )
 
 
@@ -187,7 +233,15 @@ def test_load_preferences_corrupt_json(
     _, prefs_path = settings_paths
     _write(prefs_path, "nope")
     assert app.load_preferences() == (
-        2, False, app.FETCH_LIMIT_DEFAULT, 0, "", app.CONCURRENCY_DEFAULT
+        2,
+        False,
+        app.FETCH_LIMIT_DEFAULT,
+        0,
+        "",
+        app.CONCURRENCY_DEFAULT,
+        app.TIMEOUT_LIST_DEFAULT,
+        app.TIMEOUT_DELETE_DEFAULT,
+        app.TIMEOUT_AUTH_DEFAULT,
     )
 
 
@@ -195,7 +249,17 @@ def test_load_preferences_rejects_bad_values(
     settings_paths: tuple[Path, Path],
 ) -> None:
     _, prefs_path = settings_paths
-    default = (2, False, app.FETCH_LIMIT_DEFAULT, 0, "", app.CONCURRENCY_DEFAULT)
+    default = (
+        2,
+        False,
+        app.FETCH_LIMIT_DEFAULT,
+        0,
+        "",
+        app.CONCURRENCY_DEFAULT,
+        app.TIMEOUT_LIST_DEFAULT,
+        app.TIMEOUT_DELETE_DEFAULT,
+        app.TIMEOUT_AUTH_DEFAULT,
+    )
     _write(
         prefs_path,
         json.dumps({"keep": 0, "failed_only": "yes"}),
@@ -243,6 +307,24 @@ def test_load_preferences_rejects_invalid_concurrency(
     assert app.load_preferences()[5] == app.CONCURRENCY_MAX
 
 
+def test_load_preferences_rejects_invalid_timeouts(
+    settings_paths: tuple[Path, Path],
+) -> None:
+    _, prefs_path = settings_paths
+    # Out-of-range timeouts fall back to defaults.
+    _write(prefs_path, json.dumps({"list_timeout": 2}))
+    assert app.load_preferences()[6] == app.TIMEOUT_LIST_DEFAULT
+    _write(prefs_path, json.dumps({"list_timeout": 9999}))
+    assert app.load_preferences()[6] == app.TIMEOUT_LIST_DEFAULT
+    _write(prefs_path, json.dumps({"list_timeout": "lots"}))
+    assert app.load_preferences()[6] == app.TIMEOUT_LIST_DEFAULT
+    # Boundary values are accepted.
+    _write(prefs_path, json.dumps({"list_timeout": app.TIMEOUT_MIN}))
+    assert app.load_preferences()[6] == app.TIMEOUT_MIN
+    _write(prefs_path, json.dumps({"list_timeout": app.TIMEOUT_MAX}))
+    assert app.load_preferences()[6] == app.TIMEOUT_MAX
+
+
 def test_load_preferences_accepts_valid_new_fields(
     settings_paths: tuple[Path, Path],
 ) -> None:
@@ -265,6 +347,9 @@ def test_load_preferences_accepts_valid_new_fields(
         app.MAX_DELETIONS_MAX,
         "",
         app.CONCURRENCY_DEFAULT,
+        app.TIMEOUT_LIST_DEFAULT,
+        app.TIMEOUT_DELETE_DEFAULT,
+        app.TIMEOUT_AUTH_DEFAULT,
     )
     # 0 deletions and the minimum fetch limit are both accepted.
     _write(prefs_path, json.dumps({"fetch_limit": app.FETCH_LIMIT_MIN}))

@@ -62,6 +62,12 @@ PREFERENCES_PATH = os.path.join(
 GH_LIST_TIMEOUT = 60  # seconds for `gh run list`
 GH_DELETE_TIMEOUT = 60  # seconds per `gh run delete`
 GH_AUTH_TIMEOUT = 30  # seconds for `gh auth status`
+#: Bounds for the user-configurable timeouts (seconds).
+TIMEOUT_MIN = 5
+TIMEOUT_MAX = 600
+TIMEOUT_LIST_DEFAULT = 60
+TIMEOUT_DELETE_DEFAULT = 60
+TIMEOUT_AUTH_DEFAULT = 30
 
 #: Granularity of one `gh run list` page; total fetch capped by `fetch_limit`.
 GH_PAGE_SIZE = 100
@@ -128,6 +134,7 @@ def list_runs(
     repo: str,
     fetch_limit: int = FETCH_LIMIT_DEFAULT,
     workflow: str = "",
+    timeout: int = GH_LIST_TIMEOUT,
 ) -> list[RunInfo]:
     """Fetch up to `fetch_limit` most-recent workflow runs for `repo`.
 
@@ -155,7 +162,7 @@ def list_runs(
         capture_output=True,
         text=True,
         check=True,
-        timeout=GH_LIST_TIMEOUT,
+        timeout=timeout,
     )
     data: Any = json.loads(result.stdout)
     if not isinstance(data, list):
@@ -244,19 +251,33 @@ def save_repos(repos: list[str]) -> bool:
         return False
 
 
-def load_preferences() -> tuple[int, bool, int, int, str, int]:
-    """Return ``(keep, failed_only, fetch_limit, max_deletions, last_repo, concurrency)``."""
+def load_preferences() -> tuple[int, bool, int, int, str, int, int, int, int]:
+    """Return ``(keep, failed_only, fetch_limit, max_deletions, last_repo,
+    concurrency, list_timeout, delete_timeout, auth_timeout)``."""
     keep = 2
     failed_only = False
     fetch_limit = FETCH_LIMIT_DEFAULT
     max_deletions = MAX_DELETIONS_MIN
     last_repo = ""
     concurrency = CONCURRENCY_DEFAULT
+    list_timeout = TIMEOUT_LIST_DEFAULT
+    delete_timeout = TIMEOUT_DELETE_DEFAULT
+    auth_timeout = TIMEOUT_AUTH_DEFAULT
     try:
         with open(PREFERENCES_PATH, encoding="utf-8") as f:
             data: Any = json.load(f)
     except OSError, json.JSONDecodeError:
-        return keep, failed_only, fetch_limit, max_deletions, last_repo, concurrency
+        return (
+            keep,
+            failed_only,
+            fetch_limit,
+            max_deletions,
+            last_repo,
+            concurrency,
+            list_timeout,
+            delete_timeout,
+            auth_timeout,
+        )
     obj = _as_dict(data)
     raw_keep = obj.get("keep")
     if (
@@ -292,7 +313,38 @@ def load_preferences() -> tuple[int, bool, int, int, str, int]:
         and CONCURRENCY_MIN <= raw_concurrency <= CONCURRENCY_MAX
     ):
         concurrency = raw_concurrency
-    return keep, failed_only, fetch_limit, max_deletions, last_repo, concurrency
+    raw_list_timeout = obj.get("list_timeout")
+    if (
+        isinstance(raw_list_timeout, int)
+        and not isinstance(raw_list_timeout, bool)
+        and TIMEOUT_MIN <= raw_list_timeout <= TIMEOUT_MAX
+    ):
+        list_timeout = raw_list_timeout
+    raw_delete_timeout = obj.get("delete_timeout")
+    if (
+        isinstance(raw_delete_timeout, int)
+        and not isinstance(raw_delete_timeout, bool)
+        and TIMEOUT_MIN <= raw_delete_timeout <= TIMEOUT_MAX
+    ):
+        delete_timeout = raw_delete_timeout
+    raw_auth_timeout = obj.get("auth_timeout")
+    if (
+        isinstance(raw_auth_timeout, int)
+        and not isinstance(raw_auth_timeout, bool)
+        and TIMEOUT_MIN <= raw_auth_timeout <= TIMEOUT_MAX
+    ):
+        auth_timeout = raw_auth_timeout
+    return (
+        keep,
+        failed_only,
+        fetch_limit,
+        max_deletions,
+        last_repo,
+        concurrency,
+        list_timeout,
+        delete_timeout,
+        auth_timeout,
+    )
 
 
 def save_preferences(
@@ -302,6 +354,9 @@ def save_preferences(
     max_deletions: int = MAX_DELETIONS_MIN,
     last_repo: str = "",
     concurrency: int = CONCURRENCY_DEFAULT,
+    list_timeout: int = TIMEOUT_LIST_DEFAULT,
+    delete_timeout: int = TIMEOUT_DELETE_DEFAULT,
+    auth_timeout: int = TIMEOUT_AUTH_DEFAULT,
 ) -> bool:
     """Persist preferences (never dry-run — see AGENTS.md §4.3)."""
     try:
@@ -314,6 +369,9 @@ def save_preferences(
                     "max_deletions": max_deletions,
                     "last_repo": last_repo,
                     "concurrency": concurrency,
+                    "list_timeout": list_timeout,
+                    "delete_timeout": delete_timeout,
+                    "auth_timeout": auth_timeout,
                 },
                 f,
                 indent=2,
@@ -323,7 +381,7 @@ def save_preferences(
         return False
 
 
-def delete_run(repo: str, run_id: str) -> tuple[bool, str]:
+def delete_run(repo: str, run_id: str, timeout: int = GH_DELETE_TIMEOUT) -> tuple[bool, str]:
     """Delete a single workflow run. Returns ``(success, error detail)``."""
     try:
         result = subprocess.run(
@@ -331,7 +389,7 @@ def delete_run(repo: str, run_id: str) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             check=False,
-            timeout=GH_DELETE_TIMEOUT,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return False, "timed out"
@@ -345,7 +403,7 @@ def delete_run(repo: str, run_id: str) -> tuple[bool, str]:
     return True, ""
 
 
-def check_gh_auth() -> str:
+def check_gh_auth(timeout: int = GH_AUTH_TIMEOUT) -> str:
     """Preflight `gh`; return an error message or "" when ready to go."""
     if shutil.which("gh") is None:
         return (
@@ -357,7 +415,7 @@ def check_gh_auth() -> str:
             capture_output=True,
             text=True,
             check=False,
-            timeout=GH_AUTH_TIMEOUT,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return "`gh auth status` timed out"
@@ -388,6 +446,9 @@ class CleanupWorker(QThread):
         max_deletions: int = MAX_DELETIONS_MIN,
         workflow: str = "",
         concurrency: int = CONCURRENCY_DEFAULT,
+        list_timeout: int = TIMEOUT_LIST_DEFAULT,
+        delete_timeout: int = TIMEOUT_DELETE_DEFAULT,
+        auth_timeout: int = TIMEOUT_AUTH_DEFAULT,
         parent: QObject | None = None,
     ):
         super().__init__(parent)
@@ -402,6 +463,10 @@ class CleanupWorker(QThread):
         self.workflow = workflow.strip()
         # 1 == sequential; >1 spawns a pool of that size for parallel deletes.
         self.concurrency = max(CONCURRENCY_MIN, min(concurrency, CONCURRENCY_MAX))
+        # Per-`gh`-command timeouts in seconds (clamped to TIMEOUT_MIN..MAX).
+        self.list_timeout = max(TIMEOUT_MIN, min(list_timeout, TIMEOUT_MAX))
+        self.delete_timeout = max(TIMEOUT_MIN, min(delete_timeout, TIMEOUT_MAX))
+        self.auth_timeout = max(TIMEOUT_MIN, min(auth_timeout, TIMEOUT_MAX))
         self._cancelled = False
         self._pause_gate = threading.Event()
         self._pause_gate.set()  # set == running, cleared == paused
@@ -435,7 +500,7 @@ class CleanupWorker(QThread):
     def run(self) -> None:
         try:
             self.log_signal.emit("Checking gh CLI authentication...")
-            auth_error = check_gh_auth()
+            auth_error = check_gh_auth(self.auth_timeout)
             if auth_error:
                 self.log_signal.emit(f"Error: {auth_error}")
                 self.finished_signal.emit(1)
@@ -443,7 +508,9 @@ class CleanupWorker(QThread):
             self.log_signal.emit(f"Fetching workflow runs for {self.repo}...")
             if self.workflow:
                 self.log_signal.emit(f"  (filtered to workflow: {self.workflow})")
-            runs = list_runs(self.repo, self.fetch_limit, self.workflow)
+            runs = list_runs(
+                self.repo, self.fetch_limit, self.workflow, self.list_timeout
+            )
             if self.failed_only:
                 runs = filter_failed_runs(runs)
                 self.log_signal.emit(
@@ -510,7 +577,7 @@ class CleanupWorker(QThread):
             for run_id in delete_ids:
                 if not self._wait_if_paused():
                     break
-                ok, detail = delete_run(self.repo, run_id)
+                ok, detail = delete_run(self.repo, run_id, self.delete_timeout)
                 done += 1
                 if ok:
                     self.log_signal.emit(f"  Deleted run {run_id}")
@@ -529,6 +596,7 @@ class CleanupWorker(QThread):
             from concurrent.futures import ThreadPoolExecutor
 
             batch_size = self.concurrency
+            delete_timeout = self.delete_timeout  # capture for the lambda
             for start in range(0, total, batch_size):
                 if self._cancelled:
                     break
@@ -538,7 +606,8 @@ class CleanupWorker(QThread):
                 with ThreadPoolExecutor(max_workers=batch_size) as executor:
                     results = list(
                         executor.map(
-                            lambda rid: delete_run(self.repo, rid), batch
+                            lambda rid: delete_run(self.repo, rid, delete_timeout),
+                            batch,
                         )
                     )
                 for run_id, (ok, detail) in zip(batch, results):
@@ -634,14 +703,25 @@ class MainWindow(QWidget):
         self._last_dry_run = True
         self._last_summary = (0, 0, 0)
         self.setup_ui()
-        keep, failed_only, fetch_limit, max_deletions, last_repo, concurrency = (
-            load_preferences()
-        )
+        (
+            keep,
+            failed_only,
+            fetch_limit,
+            max_deletions,
+            last_repo,
+            concurrency,
+            list_timeout,
+            delete_timeout,
+            auth_timeout,
+        ) = load_preferences()
         self.keep_spin.setValue(keep)
         self.failed_only_check.setChecked(failed_only)
         self.fetch_limit_spin.setValue(fetch_limit)
         self.max_deletions_spin.setValue(max_deletions)
         self.concurrency_spin.setValue(concurrency)
+        self.list_timeout_spin.setValue(list_timeout)
+        self.delete_timeout_spin.setValue(delete_timeout)
+        self.auth_timeout_spin.setValue(auth_timeout)
         if last_repo:
             self.repo_input.setText(last_repo)
         self._refresh_cleanup_enabled()
@@ -732,6 +812,42 @@ class MainWindow(QWidget):
 
         form.setLayout(form_layout)
 
+        # Timeouts live in a collapsible group so the default Settings
+        # panel stays compact; power users can widen them if `gh` is slow.
+        advanced = QGroupBox("Advanced (timeouts)")
+        advanced.setCheckable(True)
+        advanced.setChecked(False)
+        advanced_layout = QFormLayout()
+
+        self.list_timeout_spin = QSpinBox()
+        self.list_timeout_spin.setRange(TIMEOUT_MIN, TIMEOUT_MAX)
+        self.list_timeout_spin.setValue(TIMEOUT_LIST_DEFAULT)
+        self.list_timeout_spin.setSingleStep(10)
+        self.list_timeout_spin.setToolTip(
+            "Seconds before `gh run list` is cancelled"
+        )
+        advanced_layout.addRow("List timeout (s):", self.list_timeout_spin)
+
+        self.delete_timeout_spin = QSpinBox()
+        self.delete_timeout_spin.setRange(TIMEOUT_MIN, TIMEOUT_MAX)
+        self.delete_timeout_spin.setValue(TIMEOUT_DELETE_DEFAULT)
+        self.delete_timeout_spin.setSingleStep(10)
+        self.delete_timeout_spin.setToolTip(
+            "Seconds before each `gh run delete` is cancelled"
+        )
+        advanced_layout.addRow("Delete timeout (s):", self.delete_timeout_spin)
+
+        self.auth_timeout_spin = QSpinBox()
+        self.auth_timeout_spin.setRange(TIMEOUT_MIN, TIMEOUT_MAX)
+        self.auth_timeout_spin.setValue(TIMEOUT_AUTH_DEFAULT)
+        self.auth_timeout_spin.setSingleStep(5)
+        self.auth_timeout_spin.setToolTip(
+            "Seconds before `gh auth status` is cancelled"
+        )
+        advanced_layout.addRow("Auth timeout (s):", self.auth_timeout_spin)
+
+        advanced.setLayout(advanced_layout)
+
         self.cleanup_btn = QPushButton("Clean Up Actions")
         self.cleanup_btn.clicked.connect(self.start_cleanup)
 
@@ -755,6 +871,7 @@ class MainWindow(QWidget):
 
         layout = QVBoxLayout()
         layout.addWidget(form)
+        layout.addWidget(advanced)
         button_row = QHBoxLayout()
         button_row.addWidget(self.cleanup_btn)
         button_row.addWidget(self.cancel_btn)
@@ -860,6 +977,9 @@ class MainWindow(QWidget):
             self.max_deletions_spin.value(),
             repo,
             self.concurrency_spin.value(),
+            self.list_timeout_spin.value(),
+            self.delete_timeout_spin.value(),
+            self.auth_timeout_spin.value(),
         ):
             self.log_output.appendPlainText(
                 f"Warning: could not write {PREFERENCES_PATH}"
@@ -882,6 +1002,9 @@ class MainWindow(QWidget):
             max_deletions=self.max_deletions_spin.value(),
             workflow=self.workflow_input.text(),
             concurrency=self.concurrency_spin.value(),
+            list_timeout=self.list_timeout_spin.value(),
+            delete_timeout=self.delete_timeout_spin.value(),
+            auth_timeout=self.auth_timeout_spin.value(),
         )
         self.worker.log_signal.connect(self.log_output.appendPlainText)
         self.worker.max_signal.connect(self.progress_bar.setMaximum)

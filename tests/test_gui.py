@@ -361,6 +361,9 @@ def test_start_cleanup_full_lifecycle(
         "max_deletions": 0,
         "last_repo": "owner/repo",
         "concurrency": app.CONCURRENCY_DEFAULT,
+        "list_timeout": app.TIMEOUT_LIST_DEFAULT,
+        "delete_timeout": app.TIMEOUT_DELETE_DEFAULT,
+        "auth_timeout": app.TIMEOUT_AUTH_DEFAULT,
     }
     window.close()
 

@@ -40,21 +40,32 @@ class _GhMock:
         self.delete_calls: list[str] = []
         self.list_fetch_limit = 0
         self.list_workflow = ""
+        self.list_timeout_seen = 0
+        self.delete_timeout_seen = 0
+        self.auth_timeout_seen = 0
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_auth() -> str:
+        def fake_auth(timeout: int = 30) -> str:
+            self.auth_timeout_seen = timeout
             return self.auth_error
 
         def fake_list(
-            repo: str, fetch_limit: int = 0, workflow: str = ""
+            repo: str,
+            fetch_limit: int = 0,
+            workflow: str = "",
+            timeout: int = 60,
         ) -> list[app.RunInfo]:
+            self.list_timeout_seen = timeout
             if self.list_error is not None:
                 raise self.list_error
             self.list_fetch_limit = fetch_limit
             self.list_workflow = workflow
             return list(self.runs)
 
-        def fake_delete(repo: str, run_id: str) -> tuple[bool, str]:
+        def fake_delete(
+            repo: str, run_id: str, timeout: int = 60
+        ) -> tuple[bool, str]:
+            self.delete_timeout_seen = timeout
             if self.delete_error is not None:
                 raise self.delete_error
             self.delete_calls.append(run_id)
@@ -358,10 +369,10 @@ def test_concurrency_reports_failed_ids_by_name(
     # Override the mock's delete after install so the worker uses flaky_delete.
     original_delete = app.delete_run
 
-    def flaky_delete(repo: str, run_id: str) -> tuple[bool, str]:
+    def flaky_delete(repo: str, run_id: str, timeout: int = 60) -> tuple[bool, str]:
         if run_id == "1":
             return False, "boom"
-        return original_delete(repo, run_id)
+        return original_delete(repo, run_id, timeout)
 
     monkeypatch.setattr(app, "delete_run", flaky_delete)
 
