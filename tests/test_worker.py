@@ -303,6 +303,94 @@ def test_max_deletions_zero_means_unlimited(
     assert result.finished == [0]
 
 
+def test_concurrency_one_is_sequential(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    gh = _GhMock()
+    gh.runs = _sample_runs(make_run)
+    gh.install(monkeypatch)
+
+    worker = app.CleanupWorker(
+        "owner/repo", keep=1, dry_run=False, concurrency=1
+    )
+    result = _run_worker(worker)
+
+    assert gh.delete_calls == ["3"]
+    assert result.finished == [0]
+
+
+def test_concurrency_parallel_deletes_all(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    """A pool of workers still deletes every targeted run; failed IDs are
+    reported by name in the log instead of just a count."""
+    gh = _GhMock()
+    gh.runs = [
+        make_run(1, "old-a", "2024-05-01T00:00:00Z"),
+        make_run(2, "old-b", "2024-05-02T00:00:00Z"),
+        make_run(3, "old-c", "2024-05-03T00:00:00Z"),
+        make_run(4, "new", "2024-06-01T00:00:00Z"),
+    ]
+    gh.install(monkeypatch)
+
+    worker = app.CleanupWorker(
+        "owner/repo", keep=1, dry_run=False, concurrency=4
+    )
+    result = _run_worker(worker)
+
+    assert set(gh.delete_calls) == {"1", "2", "3"}
+    assert result.finished == [0]
+
+
+def test_concurrency_reports_failed_ids_by_name(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    """A parallel run still reports failed IDs by name in the log."""
+    gh = _GhMock()
+    gh.runs = [
+        make_run(1, "old-a", "2024-05-01T00:00:00Z"),
+        make_run(2, "old-b", "2024-05-02T00:00:00Z"),
+        make_run(3, "new", "2024-06-01T00:00:00Z"),
+    ]
+    gh.install(monkeypatch)
+
+    # Make run "1" fail so the log should name it explicitly.
+    # Override the mock's delete after install so the worker uses flaky_delete.
+    original_delete = app.delete_run
+
+    def flaky_delete(repo: str, run_id: str) -> tuple[bool, str]:
+        if run_id == "1":
+            return False, "boom"
+        return original_delete(repo, run_id)
+
+    monkeypatch.setattr(app, "delete_run", flaky_delete)
+
+    worker = app.CleanupWorker(
+        "owner/repo", keep=1, dry_run=False, concurrency=3
+    )
+    result = _run_worker(worker)
+
+    assert result.finished == [1]
+    assert any("run 1" in line and "boom" in line for line in result.logs)
+    assert any(
+        line.startswith("Cleanup finished with 1 failure(s):")
+        and "1" in line
+        for line in result.logs
+    )
+
+
+def test_concurrency_clamped_to_bounds() -> None:
+    worker = app.CleanupWorker(
+        "owner/repo", keep=1, dry_run=True, concurrency=0
+    )
+    assert worker.concurrency == app.CONCURRENCY_MIN
+
+    worker = app.CleanupWorker(
+        "owner/repo", keep=1, dry_run=True, concurrency=99
+    )
+    assert worker.concurrency == app.CONCURRENCY_MAX
+
+
 def test_pause_blocks_until_resumed(
     monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
 ) -> None:

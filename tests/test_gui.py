@@ -360,6 +360,7 @@ def test_start_cleanup_full_lifecycle(
         "fetch_limit": app.FETCH_LIMIT_DEFAULT,
         "max_deletions": 0,
         "last_repo": "owner/repo",
+        "concurrency": app.CONCURRENCY_DEFAULT,
     }
     window.close()
 

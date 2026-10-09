@@ -72,6 +72,10 @@ FETCH_LIMIT_DEFAULT = 1000
 #: Bounds for the user-configurable per-run deletion cap (0 = unlimited).
 MAX_DELETIONS_MIN = 0
 MAX_DELETIONS_MAX = 10000
+#: Bounds for the user-configurable deletion concurrency (1 = sequential).
+CONCURRENCY_MIN = 1
+CONCURRENCY_MAX = 10
+CONCURRENCY_DEFAULT = 1
 
 DRY_RUN_PROGRESS_STEP = 25  # throttle progress signals during dry runs
 LOG_MAX_BLOCKS = 5000  # cap on the log widget's line count
@@ -240,18 +244,19 @@ def save_repos(repos: list[str]) -> bool:
         return False
 
 
-def load_preferences() -> tuple[int, bool, int, int, str]:
-    """Return ``(keep, failed_only, fetch_limit, max_deletions, last_repo)``."""
+def load_preferences() -> tuple[int, bool, int, int, str, int]:
+    """Return ``(keep, failed_only, fetch_limit, max_deletions, last_repo, concurrency)``."""
     keep = 2
     failed_only = False
     fetch_limit = FETCH_LIMIT_DEFAULT
     max_deletions = MAX_DELETIONS_MIN
     last_repo = ""
+    concurrency = CONCURRENCY_DEFAULT
     try:
         with open(PREFERENCES_PATH, encoding="utf-8") as f:
             data: Any = json.load(f)
     except OSError, json.JSONDecodeError:
-        return keep, failed_only, fetch_limit, max_deletions, last_repo
+        return keep, failed_only, fetch_limit, max_deletions, last_repo, concurrency
     obj = _as_dict(data)
     raw_keep = obj.get("keep")
     if (
@@ -280,7 +285,14 @@ def load_preferences() -> tuple[int, bool, int, int, str]:
     raw_last_repo = obj.get("last_repo")
     if isinstance(raw_last_repo, str) and is_valid_repo(raw_last_repo):
         last_repo = raw_last_repo
-    return keep, failed_only, fetch_limit, max_deletions, last_repo
+    raw_concurrency = obj.get("concurrency")
+    if (
+        isinstance(raw_concurrency, int)
+        and not isinstance(raw_concurrency, bool)
+        and CONCURRENCY_MIN <= raw_concurrency <= CONCURRENCY_MAX
+    ):
+        concurrency = raw_concurrency
+    return keep, failed_only, fetch_limit, max_deletions, last_repo, concurrency
 
 
 def save_preferences(
@@ -289,6 +301,7 @@ def save_preferences(
     fetch_limit: int = FETCH_LIMIT_DEFAULT,
     max_deletions: int = MAX_DELETIONS_MIN,
     last_repo: str = "",
+    concurrency: int = CONCURRENCY_DEFAULT,
 ) -> bool:
     """Persist preferences (never dry-run — see AGENTS.md §4.3)."""
     try:
@@ -300,6 +313,7 @@ def save_preferences(
                     "fetch_limit": fetch_limit,
                     "max_deletions": max_deletions,
                     "last_repo": last_repo,
+                    "concurrency": concurrency,
                 },
                 f,
                 indent=2,
@@ -373,6 +387,7 @@ class CleanupWorker(QThread):
         fetch_limit: int = FETCH_LIMIT_DEFAULT,
         max_deletions: int = MAX_DELETIONS_MIN,
         workflow: str = "",
+        concurrency: int = CONCURRENCY_DEFAULT,
         parent: QObject | None = None,
     ):
         super().__init__(parent)
@@ -385,6 +400,8 @@ class CleanupWorker(QThread):
         self.max_deletions = max(0, max_deletions)
         # Empty string means "all workflows"; non-empty narrows the fetch.
         self.workflow = workflow.strip()
+        # 1 == sequential; >1 spawns a pool of that size for parallel deletes.
+        self.concurrency = max(CONCURRENCY_MIN, min(concurrency, CONCURRENCY_MAX))
         self._cancelled = False
         self._pause_gate = threading.Event()
         self._pause_gate.set()  # set == running, cleared == paused
@@ -476,7 +493,10 @@ class CleanupWorker(QThread):
         self.max_signal.emit(max(total, 1))
         done = 0
         failed = 0
+        failed_ids: list[str] = []
         if self.dry_run:
+            # Dry run is just logging — keep it sequential so the output
+            # reads top-to-bottom and the pause gate is checked per item.
             for run_id in delete_ids:
                 if not self._wait_if_paused():
                     break
@@ -484,7 +504,9 @@ class CleanupWorker(QThread):
                 self.log_signal.emit(f"  DRY-RUN: would delete run {run_id}")
                 if done % DRY_RUN_PROGRESS_STEP == 0 or done == total:
                     self.progress_signal.emit(done)
-        else:
+        elif self.concurrency <= 1 or total <= 1:
+            # Sequential path: check the pause gate between each delete so a
+            # pause/cancel is observed promptly rather than after the batch.
             for run_id in delete_ids:
                 if not self._wait_if_paused():
                     break
@@ -494,7 +516,41 @@ class CleanupWorker(QThread):
                     self.log_signal.emit(f"  Deleted run {run_id}")
                 else:
                     failed += 1
-                    self.log_signal.emit(f"  Failed to delete run {run_id}: {detail}")
+                    failed_ids.append(run_id)
+                    self.log_signal.emit(
+                        f"  Failed to delete run {run_id}: {detail}"
+                    )
+                self.progress_signal.emit(done)
+        else:
+            # Parallel path: split delete_ids into batches of `concurrency`,
+            # submit each batch to a ThreadPoolExecutor, then check the pause
+            # gate between batches. Results are collected as (run_id, ok,
+            # detail) tuples; failed IDs are reported by name at the end.
+            from concurrent.futures import ThreadPoolExecutor
+
+            batch_size = self.concurrency
+            for start in range(0, total, batch_size):
+                if self._cancelled:
+                    break
+                if not self._wait_if_paused():
+                    break
+                batch = delete_ids[start : start + batch_size]
+                with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                    results = list(
+                        executor.map(
+                            lambda rid: delete_run(self.repo, rid), batch
+                        )
+                    )
+                for run_id, (ok, detail) in zip(batch, results):
+                    done += 1
+                    if ok:
+                        self.log_signal.emit(f"  Deleted run {run_id}")
+                    else:
+                        failed += 1
+                        failed_ids.append(run_id)
+                        self.log_signal.emit(
+                            f"  Failed to delete run {run_id}: {detail}"
+                        )
                 self.progress_signal.emit(done)
 
         self.summary_signal.emit(kept, done - failed, failed)
@@ -503,7 +559,10 @@ class CleanupWorker(QThread):
             self.finished_signal.emit(2)
             return
         if failed:
-            self.log_signal.emit(f"Cleanup finished with {failed} failure(s).")
+            self.log_signal.emit(
+                f"Cleanup finished with {failed} failure(s): "
+                f"{', '.join(failed_ids)}"
+            )
             self.finished_signal.emit(1)
             return
         self.log_signal.emit("Cleanup complete.")
@@ -575,11 +634,14 @@ class MainWindow(QWidget):
         self._last_dry_run = True
         self._last_summary = (0, 0, 0)
         self.setup_ui()
-        keep, failed_only, fetch_limit, max_deletions, last_repo = load_preferences()
+        keep, failed_only, fetch_limit, max_deletions, last_repo, concurrency = (
+            load_preferences()
+        )
         self.keep_spin.setValue(keep)
         self.failed_only_check.setChecked(failed_only)
         self.fetch_limit_spin.setValue(fetch_limit)
         self.max_deletions_spin.setValue(max_deletions)
+        self.concurrency_spin.setValue(concurrency)
         if last_repo:
             self.repo_input.setText(last_repo)
         self._refresh_cleanup_enabled()
@@ -641,6 +703,15 @@ class MainWindow(QWidget):
             "Stop after deleting this many runs in one pass (0 = no limit)"
         )
         form_layout.addRow("Max deletions:", self.max_deletions_spin)
+
+        self.concurrency_spin = QSpinBox()
+        self.concurrency_spin.setRange(CONCURRENCY_MIN, CONCURRENCY_MAX)
+        self.concurrency_spin.setValue(CONCURRENCY_DEFAULT)
+        self.concurrency_spin.setToolTip(
+            "Parallel `gh run delete` calls (1 = sequential; "
+            "only used when there are >1 run to delete)"
+        )
+        form_layout.addRow("Deletion concurrency:", self.concurrency_spin)
 
         self.dry_run_check = QCheckBox("Dry run (don't actually delete)")
         self.dry_run_check.setChecked(True)
@@ -788,6 +859,7 @@ class MainWindow(QWidget):
             self.fetch_limit_spin.value(),
             self.max_deletions_spin.value(),
             repo,
+            self.concurrency_spin.value(),
         ):
             self.log_output.appendPlainText(
                 f"Warning: could not write {PREFERENCES_PATH}"
@@ -809,6 +881,7 @@ class MainWindow(QWidget):
             fetch_limit=self.fetch_limit_spin.value(),
             max_deletions=self.max_deletions_spin.value(),
             workflow=self.workflow_input.text(),
+            concurrency=self.concurrency_spin.value(),
         )
         self.worker.log_signal.connect(self.log_output.appendPlainText)
         self.worker.max_signal.connect(self.progress_bar.setMaximum)

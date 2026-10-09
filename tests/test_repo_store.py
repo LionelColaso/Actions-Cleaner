@@ -138,19 +138,32 @@ def test_save_repos_failure_returns_false(
 def test_load_preferences_defaults(
     settings_paths: tuple[Path, Path],
 ) -> None:
-    assert app.load_preferences() == (2, False, app.FETCH_LIMIT_DEFAULT, 0, "")
+    assert app.load_preferences() == (
+        2, False, app.FETCH_LIMIT_DEFAULT, 0, "", app.CONCURRENCY_DEFAULT
+    )
 
 
 def test_preferences_roundtrip(settings_paths: tuple[Path, Path]) -> None:
     assert app.save_preferences(7, True, 500, 25)
-    assert app.load_preferences() == (7, True, 500, 25, "")
+    assert app.load_preferences() == (
+        7, True, 500, 25, "", app.CONCURRENCY_DEFAULT
+    )
 
 
 def test_preferences_roundtrip_with_last_repo(
     settings_paths: tuple[Path, Path],
 ) -> None:
     assert app.save_preferences(7, True, 500, 25, "owner/repo")
-    assert app.load_preferences() == (7, True, 500, 25, "owner/repo")
+    assert app.load_preferences() == (
+        7, True, 500, 25, "owner/repo", app.CONCURRENCY_DEFAULT
+    )
+
+
+def test_preferences_roundtrip_with_concurrency(
+    settings_paths: tuple[Path, Path],
+) -> None:
+    assert app.save_preferences(7, True, 500, 25, "owner/repo", 8)
+    assert app.load_preferences() == (7, True, 500, 25, "owner/repo", 8)
 
 
 def test_preferences_roundtrip_uses_defaults_for_new_fields(
@@ -164,6 +177,7 @@ def test_preferences_roundtrip_uses_defaults_for_new_fields(
         app.FETCH_LIMIT_DEFAULT,
         0,
         "",
+        app.CONCURRENCY_DEFAULT,
     )
 
 
@@ -172,14 +186,16 @@ def test_load_preferences_corrupt_json(
 ) -> None:
     _, prefs_path = settings_paths
     _write(prefs_path, "nope")
-    assert app.load_preferences() == (2, False, app.FETCH_LIMIT_DEFAULT, 0, "")
+    assert app.load_preferences() == (
+        2, False, app.FETCH_LIMIT_DEFAULT, 0, "", app.CONCURRENCY_DEFAULT
+    )
 
 
 def test_load_preferences_rejects_bad_values(
     settings_paths: tuple[Path, Path],
 ) -> None:
     _, prefs_path = settings_paths
-    default = (2, False, app.FETCH_LIMIT_DEFAULT, 0, "")
+    default = (2, False, app.FETCH_LIMIT_DEFAULT, 0, "", app.CONCURRENCY_DEFAULT)
     _write(
         prefs_path,
         json.dumps({"keep": 0, "failed_only": "yes"}),
@@ -210,6 +226,23 @@ def test_load_preferences_rejects_bad_values(
     assert app.load_preferences() == default
 
 
+def test_load_preferences_rejects_invalid_concurrency(
+    settings_paths: tuple[Path, Path],
+) -> None:
+    _, prefs_path = settings_paths
+    _write(prefs_path, json.dumps({"concurrency": 0}))
+    assert app.load_preferences()[5] == app.CONCURRENCY_DEFAULT
+    _write(prefs_path, json.dumps({"concurrency": 100}))
+    assert app.load_preferences()[5] == app.CONCURRENCY_DEFAULT
+    _write(prefs_path, json.dumps({"concurrency": "lots"}))
+    assert app.load_preferences()[5] == app.CONCURRENCY_DEFAULT
+    # Boundary values are accepted.
+    _write(prefs_path, json.dumps({"concurrency": app.CONCURRENCY_MIN}))
+    assert app.load_preferences()[5] == app.CONCURRENCY_MIN
+    _write(prefs_path, json.dumps({"concurrency": app.CONCURRENCY_MAX}))
+    assert app.load_preferences()[5] == app.CONCURRENCY_MAX
+
+
 def test_load_preferences_accepts_valid_new_fields(
     settings_paths: tuple[Path, Path],
 ) -> None:
@@ -231,6 +264,7 @@ def test_load_preferences_accepts_valid_new_fields(
         app.FETCH_LIMIT_MAX,
         app.MAX_DELETIONS_MAX,
         "",
+        app.CONCURRENCY_DEFAULT,
     )
     # 0 deletions and the minimum fetch limit are both accepted.
     _write(prefs_path, json.dumps({"fetch_limit": app.FETCH_LIMIT_MIN}))
