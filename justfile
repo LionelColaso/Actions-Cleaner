@@ -53,7 +53,7 @@ coverage: dev-setup
 
 # Run copy/paste detection (jscpd); skip gracefully if npx is unavailable
 jscpd:
-    npx --yes jscpd@5.4.0 . --config .jscpd.json
+    npx --yes jscpd@5.4.1 . --config .jscpd.json
 
 # Run the full check suite: ruff format --check, ruff check, mypy, pyright, jscpd
 check: ruff-format-check ruffcheck typecheck jscpd
