@@ -19,12 +19,18 @@ class WorkerResult:
     def __init__(self) -> None:
         self.logs: list[str] = []
         self.finished: list[int] = []
+        self.completions: list[tuple[int, int, int, int]] = []
         self.summaries: list[tuple[int, int, int]] = []
         self.maxes: list[int] = []
         self.progress: list[int] = []
 
     def record_summary(self, kept: int, deleted: int, failed: int) -> None:
         self.summaries.append((kept, deleted, failed))
+
+    def record_completion(
+        self, result: int, kept: int, deleted: int, failed: int
+    ) -> None:
+        self.completions.append((result, kept, deleted, failed))
 
 
 class _GhMock:
@@ -80,6 +86,7 @@ def _run_worker(worker: app.CleanupWorker) -> WorkerResult:
     result = WorkerResult()
     worker.log_signal.connect(result.logs.append)
     worker.finished_signal.connect(result.finished.append)
+    worker.completion_signal.connect(result.record_completion)
     worker.summary_signal.connect(result.record_summary)
     worker.max_signal.connect(result.maxes.append)
     worker.progress_signal.connect(result.progress.append)
@@ -143,7 +150,7 @@ def test_dry_run_never_deletes(
     result = _run_worker(worker)
 
     assert gh.delete_calls == []
-    assert result.finished == [0]
+    assert result.completions == [(0, 2, 1, 0)]
     assert result.summaries == [(2, 1, 0)]
     assert result.maxes == [1]
     assert result.progress == [1]
@@ -161,7 +168,7 @@ def test_real_run_deletes_and_reports_success(
     result = _run_worker(worker)
 
     assert gh.delete_calls == ["3"]
-    assert result.finished == [0]
+    assert result.completions == [(0, 2, 1, 0)]
     assert result.summaries == [(2, 1, 0)]
     assert any("Deleted run 3" in line for line in result.logs)
 
@@ -178,7 +185,7 @@ def test_failed_deletions_produce_failure_code(
     worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False)
     result = _run_worker(worker)
 
-    assert result.finished == [1]  # never report success with failures
+    assert result.completions == [(1, 2, 0, 1)]  # never report success with failures
     assert result.summaries == [(2, 0, 1)]
     assert any("Failed to delete run 3: boom" in line for line in result.logs)
 
@@ -193,7 +200,7 @@ def test_missing_gh_cli_is_caught(
     worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
-    assert result.finished == [1]
+    assert result.completions == [(1, 0, 0, 0)]
     assert any("Error fetching runs" in line for line in result.logs)
 
 
@@ -207,7 +214,7 @@ def test_called_process_error_is_caught(
     worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
-    assert result.finished == [1]
+    assert result.completions == [(1, 0, 0, 0)]
     assert any("boom" in line for line in result.logs)
 
 
@@ -221,7 +228,7 @@ def test_unexpected_output_is_caught(
     worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
-    assert result.finished == [1]
+    assert result.completions == [(1, 0, 0, 0)]
 
 
 def test_auth_failure_short_circuits(
@@ -235,7 +242,7 @@ def test_auth_failure_short_circuits(
     worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
-    assert result.finished == [1]
+    assert result.completions == [(1, 0, 0, 0)]
     assert any("not authenticated" in line for line in result.logs)
 
 
@@ -248,7 +255,7 @@ def test_no_runs_is_not_an_error(
     worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
-    assert result.finished == [0]
+    assert result.completions == [(0, 0, 0, 0)]
     assert result.summaries == [(0, 0, 0)]
     assert any("No matching" in line for line in result.logs)
 
@@ -268,7 +275,7 @@ def test_failed_only_considers_only_failed_runs(
     result = _run_worker(worker)
 
     # Only the failed run remains, and it belongs to the single kept commit.
-    assert result.finished == [0]
+    assert result.completions == [(0, 1, 0, 0)]
     assert result.summaries == [(1, 0, 0)]
     assert any("Failed-only" in line for line in result.logs)
 
@@ -285,7 +292,7 @@ def test_cancel_stops_before_deleting(
     worker.cancel()
     result = _run_worker(worker)
 
-    assert result.finished == [2]
+    assert result.completions == [(2, 2, 0, 0)]
     assert any("cancelled" in line.lower() for line in result.logs)
 
 
@@ -317,7 +324,7 @@ def test_max_deletions_caps_processed_runs(
     # keep=1 protects the "new" commit; 3 old runs would be deleted, but the
     # cap stops after the first 2.
     assert len(gh.delete_calls) == 2
-    assert result.finished == [0]
+    assert result.completions == [(0, 1, 2, 0)]
     assert result.maxes == [2]
     assert any("Max deletions cap of 2" in line for line in result.logs)
 
@@ -335,7 +342,7 @@ def test_max_deletions_zero_means_unlimited(
     )
 
     assert len(gh.delete_calls) == 1  # only run 3 is deletable here
-    assert result.finished == [0]
+    assert result.completions == [(0, 2, 1, 0)]
 
 
 def test_concurrency_one_is_sequential(
@@ -351,7 +358,7 @@ def test_concurrency_one_is_sequential(
     )
 
     assert gh.delete_calls == ["3"]
-    assert result.finished == [0]
+    assert result.completions == [(0, 2, 1, 0)]
 
 
 def test_concurrency_parallel_deletes_all(
@@ -369,7 +376,7 @@ def test_concurrency_parallel_deletes_all(
     )
 
     assert set(gh.delete_calls) == {"1", "2", "3"}
-    assert result.finished == [0]
+    assert result.completions == [(0, 1, 3, 0)]
 
 
 def test_concurrency_reports_failed_ids_by_name(
@@ -400,7 +407,7 @@ def test_concurrency_reports_failed_ids_by_name(
     worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, concurrency=3)
     result = _run_worker(worker)
 
-    assert result.finished == [1]
+    assert result.completions == [(1, 1, 1, 1)]
     assert any("run 1" in line and "boom" in line for line in result.logs)
     assert any(
         line.startswith("Cleanup finished with 1 failure(s):") and "1" in line
@@ -433,7 +440,7 @@ def test_pause_blocks_until_resumed(
     # Released on a timer: proves run() blocked on the gate, not ignored it.
     result = _run_with_release(worker, lambda: worker.set_paused(False))
 
-    assert result.finished == [0]
+    assert result.completions == [(0, 1, 1, 0)]
     assert gh.delete_calls == ["10"]
 
 
@@ -454,5 +461,5 @@ def test_cancel_releases_a_paused_worker(
     # A pause + cancel must not deadlock; run() exits as cancelled.
     result = _run_with_release(worker, worker.cancel)
 
-    assert result.finished == [2]
+    assert result.completions == [(2, 1, 0, 0)]
     assert gh.delete_calls == []

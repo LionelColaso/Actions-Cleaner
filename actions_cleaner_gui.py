@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
@@ -442,6 +443,7 @@ class CleanupWorker(QThread):
     progress_signal = Signal(int)
     finished_signal = Signal(int)  # 0 success, 1 failure, 2 cancelled
     summary_signal = Signal(int, int, int)  # kept, deleted/targeted, failed
+    completion_signal = Signal(int, int, int, int)  # result, kept, deleted, failed
 
     def __init__(
         self,
@@ -478,11 +480,18 @@ class CleanupWorker(QThread):
         self._pause_gate = threading.Event()
         self._pause_gate.set()  # set == running, cleared == paused
         self._paused = False
+        self._executor: ThreadPoolExecutor | None = None
 
     def cancel(self) -> None:
         """Request a stop; releases the gate so a paused run() wakes up."""
         self._cancelled = True
         self._pause_gate.set()
+        if self._executor is not None:
+            try:
+                self._executor.shutdown(wait=False)
+            except OSError:
+                pass  # Ignore shutdown errors from pending futures
+            self._executor = None
 
     def set_paused(self, paused: bool) -> None:
         """Pause (True) or resume (False) the worker between `gh` calls."""
@@ -510,7 +519,7 @@ class CleanupWorker(QThread):
             auth_error = check_gh_auth(self.auth_timeout)
             if auth_error:
                 self.log_signal.emit(f"Error: {auth_error}")
-                self.finished_signal.emit(1)
+                self.completion_signal.emit(1, 0, 0, 0)
                 return
             self.log_signal.emit(f"Fetching workflow runs for {self.repo}...")
             if self.workflow:
@@ -526,17 +535,17 @@ class CleanupWorker(QThread):
         except subprocess.CalledProcessError as e:
             detail = (e.stderr or str(e)).strip()
             self.log_signal.emit(f"Error fetching runs: {detail}")
-            self.finished_signal.emit(1)
+            self.completion_signal.emit(1, 0, 0, 0)
             return
         except (OSError, subprocess.SubprocessError, ValueError, TypeError) as e:
             self.log_signal.emit(f"Error fetching runs: {e}")
-            self.finished_signal.emit(1)
+            self.completion_signal.emit(1, 0, 0, 0)
             return
 
         if not runs:
             self.log_signal.emit("No matching workflow runs found.")
             self.summary_signal.emit(0, 0, 0)
-            self.finished_signal.emit(0)
+            self.completion_signal.emit(0, 0, 0, 0)
             return
 
         delete_ids, kept_ids = select_runs_to_delete(runs, self.keep)
@@ -563,8 +572,7 @@ class CleanupWorker(QThread):
                 f"{action} {total} run(s), keeping {kept} from the "
                 f"latest {self.keep} commit(s)."
             )
-
-        self.max_signal.emit(max(total, 1))
+            self.max_signal.emit(max(total, 1))
         done = 0
         failed = 0
         failed_ids: list[str] = []
@@ -607,7 +615,10 @@ class CleanupWorker(QThread):
                 if not self._wait_if_paused():
                     break
                 batch = delete_ids[start : start + batch_size]
-                with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                # Use manual executor management to avoid context manager issues on early exit
+                executor = ThreadPoolExecutor(max_workers=batch_size)
+                try:
+                    self._executor = executor
                     results = list(
                         executor.map(
                             _delete_one,
@@ -616,6 +627,12 @@ class CleanupWorker(QThread):
                             [self.delete_timeout] * len(batch),
                         )
                     )
+                finally:
+                    self._executor = None
+                    try:
+                        executor.shutdown(wait=False)
+                    except OSError:
+                        pass  # Ignore shutdown errors from pending futures
                 for run_id, (ok, detail) in zip(batch, results):
                     done += 1
                     if ok:
@@ -628,19 +645,21 @@ class CleanupWorker(QThread):
                         )
                 self.progress_signal.emit(done)
 
-        self.summary_signal.emit(kept, done - failed, failed)
+        # Emit a single combined signal so the GUI never races on `_last_summary`.
+        deleted_count = done - failed
+        self.summary_signal.emit(kept, deleted_count, failed)
         if self._cancelled:
             self.log_signal.emit("Cleanup cancelled.")
-            self.finished_signal.emit(2)
+            self.completion_signal.emit(2, kept, deleted_count, failed)
             return
         if failed:
             self.log_signal.emit(
                 f"Cleanup finished with {failed} failure(s): {', '.join(failed_ids)}"
             )
-            self.finished_signal.emit(1)
+            self.completion_signal.emit(1, kept, deleted_count, failed)
             return
         self.log_signal.emit("Cleanup complete.")
-        self.finished_signal.emit(0)
+        self.completion_signal.emit(0, kept, deleted_count, failed)
 
 
 #: Directory holding the packaged icon assets (SVG source + rendered rasters).
@@ -1018,7 +1037,7 @@ class MainWindow(QWidget):
         self.worker.max_signal.connect(self.progress_bar.setMaximum)
         self.worker.progress_signal.connect(self.progress_bar.setValue)
         self.worker.summary_signal.connect(self.on_summary)
-        self.worker.finished_signal.connect(self.on_cleanup_finished)
+        self.worker.completion_signal.connect(self.on_cleanup_finished)
         self.worker.finished.connect(self.on_thread_finished)
         self.worker.start()
         self._refresh_cleanup_enabled()
@@ -1057,7 +1076,9 @@ class MainWindow(QWidget):
     def on_summary(self, kept: int, deleted: int, failed: int) -> None:
         self._last_summary = (kept, deleted, failed)
 
-    def on_cleanup_finished(self, result: int) -> None:
+    def on_cleanup_finished(
+        self, result: int, kept: int, deleted: int, failed: int
+    ) -> None:
         """Reset UI state and report the outcome (0 ok, 1 fail, 2 cancel)."""
         self.cancel_btn.setVisible(False)
         self.cancel_btn.setEnabled(True)
@@ -1067,7 +1088,6 @@ class MainWindow(QWidget):
         self.progress_bar.setVisible(False)
         self._refresh_cleanup_enabled()
 
-        kept, deleted, failed = self._last_summary
         elapsed = time.monotonic() - self._run_started if self._run_started else 0.0
         if self._last_dry_run:
             state = "Dry run"

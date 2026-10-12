@@ -47,7 +47,7 @@ class _InstantWorker(app.CleanupWorker):
     def run(self) -> None:
         self.log_signal.emit("fake run")
         self.summary_signal.emit(1, 0, 0)
-        self.finished_signal.emit(0)
+        self.completion_signal.emit(0, 1, 0, 0)
 
 
 class _RunningWorker(app.CleanupWorker):
@@ -242,9 +242,7 @@ def test_finished_resets_ui_and_reports_dry_run_success(
     window.progress_bar.setVisible(True)
     window.worker = app.CleanupWorker("owner/repo", 2, True)
     window._last_dry_run = True
-    window._last_summary = (5, 3, 0)
-
-    window.on_cleanup_finished(0)
+    window.on_cleanup_finished(0, 5, 3, 0)
 
     assert window.progress_bar.isHidden()
     assert not window.summary_label.isHidden()
@@ -259,9 +257,7 @@ def test_finished_resets_ui_and_reports_dry_run_success(
 def test_finished_failure_reports_critical(dialogs: Calls) -> None:
     window = app.MainWindow()
     window._last_dry_run = False
-    window._last_summary = (2, 1, 1)
-
-    window.on_cleanup_finished(1)
+    window.on_cleanup_finished(1, 2, 1, 1)
 
     assert dialogs["critical"]
     assert "Failed" in window.summary_label.text()
@@ -271,9 +267,7 @@ def test_finished_failure_reports_critical(dialogs: Calls) -> None:
 def test_finished_cancel_reports_information(dialogs: Calls) -> None:
     window = app.MainWindow()
     window._last_dry_run = False
-    window._last_summary = (4, 2, 0)
-
-    window.on_cleanup_finished(2)
+    window.on_cleanup_finished(2, 4, 2, 0)
 
     assert dialogs["information"]
     assert "Cancelled" in window.summary_label.text()
@@ -286,7 +280,7 @@ def test_finished_suppresses_dialogs_while_closing(
     window = app.MainWindow()
     window._close_pending = True
 
-    window.on_cleanup_finished(0)
+    window.on_cleanup_finished(0, 0, 0, 0)
 
     assert not dialogs["information"]
     assert not dialogs["critical"]
