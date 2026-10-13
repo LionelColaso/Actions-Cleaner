@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import threading
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from .gh_retry import run_gh_with_retry
 from .selection import (
+    ALL_CONCLUSIONS,
     filter_failed_runs,
+    filter_runs_by_conclusions,
     list_runs,
     select_runs_to_delete,
 )
@@ -31,12 +35,45 @@ from .settings import (
 #: Bounds for the user-configurable per-run deletion cap (0 = unlimited).
 MAX_DELETIONS_MAX = 5000
 
+#: Minimum required gh CLI version (major.minor)
+GH_MIN_VERSION = (2, 0)
 
 GH_LIST_TIMEOUT = 60
 GH_DELETE_TIMEOUT = 30
 GH_AUTH_TIMEOUT = 15
 
 DRY_RUN_PROGRESS_STEP = 25
+
+
+def get_gh_version() -> tuple[int, int] | None:
+    """Return parsed (major, minor) version of gh CLI, or None if unavailable."""
+    try:
+        result = subprocess.run(
+            ["gh", "version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired, OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    # Output format: "gh version 2.45.0 (2024-01-15)..." or similar
+    match = re.search(r"gh version\s+(\d+)\.(\d+)\.(\d+)", result.stdout)
+    if match:
+        return (int(match.group(1)), int(match.group(2)))
+    return None
+
+
+def check_gh_version() -> str:
+    """Check gh version meets minimum requirement; return warning message or empty string."""
+    version = get_gh_version()
+    if version is None:
+        return "could not determine `gh` version"
+    if version < GH_MIN_VERSION:
+        return f"`gh` version {version[0]}.{version[1]} is older than minimum {GH_MIN_VERSION[0]}.{GH_MIN_VERSION[1]}; some features may not work"
+    return ""
 
 
 def check_gh_auth(timeout: int = GH_AUTH_TIMEOUT) -> str:
@@ -64,21 +101,18 @@ def check_gh_auth(timeout: int = GH_AUTH_TIMEOUT) -> str:
 
 
 def delete_run(
-    repo: str, run_id: str, timeout: int = GH_DELETE_TIMEOUT
+    repo: str,
+    run_id: str,
+    timeout: int = GH_DELETE_TIMEOUT,
+    log_signal: object = None,
 ) -> tuple[bool, str]:
     """Delete a single workflow run. Returns ``(success, error detail)``."""
-    try:
-        result = subprocess.run(
-            ["gh", "run", "delete", run_id, "--repo", repo],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "timed out"
-    except OSError as e:
-        return False, str(e)
+    from PySide6.QtCore import Signal
+
+    cmd = ["gh", "run", "delete", run_id, "--repo", repo]
+    result = run_gh_with_retry(cmd, timeout, log_signal or Signal(str))
+    if result is None:
+        return False, "failed after retries or cancelled"
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         if not detail:
@@ -88,7 +122,10 @@ def delete_run(
 
 
 def delete_runs_batch(
-    repo: str, run_ids: list[str], timeout: int = GH_DELETE_TIMEOUT
+    repo: str,
+    run_ids: list[str],
+    timeout: int = GH_DELETE_TIMEOUT,
+    log_signal: object = None,
 ) -> list[tuple[str, bool, str]]:
     """Delete multiple workflow runs in a single `gh run delete` call.
 
@@ -96,20 +133,14 @@ def delete_runs_batch(
     """
     if not run_ids:
         return []
-    try:
-        cmd = ["gh", "run", "delete", "--repo", repo] + run_ids
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return [(run_id, False, "timed out") for run_id in run_ids]
-    except OSError as e:
-        return [(run_id, False, str(e)) for run_id in run_ids]
+    from PySide6.QtCore import Signal
 
+    cmd = ["gh", "run", "delete", "--repo", repo] + run_ids
+    result = run_gh_with_retry(cmd, timeout, log_signal or Signal(str))
+    if result is None:
+        return [
+            (run_id, False, "failed after retries or cancelled") for run_id in run_ids
+        ]
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         if not detail:
@@ -143,6 +174,7 @@ class CleanupWorker(QThread):
         delete_timeout: int = TIMEOUT_DELETE_DEFAULT,
         auth_timeout: int = TIMEOUT_AUTH_DEFAULT,
         older_than_days: int = 0,
+        conclusions: set[str] | None = None,
         parent: QObject | None = None,
     ):
         super().__init__(parent)
@@ -163,6 +195,8 @@ class CleanupWorker(QThread):
         self.auth_timeout = max(TIMEOUT_MIN, min(auth_timeout, TIMEOUT_MAX))
         # Date range filter: 0 = disabled, >0 = only consider runs older than N days
         self.older_than_days = max(0, older_than_days)
+        # Conclusion filter: None = all, empty set = no filter, otherwise filter by conclusions
+        self.conclusions = conclusions if conclusions is not None else ALL_CONCLUSIONS
         self._cancelled = False
         self._pause_gate = threading.Event()
         self._pause_gate.set()  # set == running, cleared == paused
@@ -201,17 +235,31 @@ class CleanupWorker(QThread):
                 self.log_signal.emit(f"Error: {auth_error}")
                 self.completion_signal.emit(1, 0, 0, 0)
                 return
+            # Check gh version
+            version_warning = check_gh_version()
+            if version_warning:
+                self.log_signal.emit(f"Warning: {version_warning}")
             self.log_signal.emit(f"Fetching workflow runs for {self.repo}...")
             if self.workflow:
                 self.log_signal.emit(f"  (filtered to workflow: {self.workflow})")
             runs = list_runs(
-                self.repo, self.fetch_limit, self.workflow, self.list_timeout
+                self.repo,
+                self.fetch_limit,
+                self.workflow,
+                self.list_timeout,
+                self.log_signal,
             )
             if self.failed_only:
                 runs = filter_failed_runs(runs)
                 self.log_signal.emit(
                     "Failed-only mode: considering failure/cancelled/timed-out runs."
                 )
+            elif self.conclusions != ALL_CONCLUSIONS:
+                runs = filter_runs_by_conclusions(runs, self.conclusions)
+                if self.conclusions:
+                    self.log_signal.emit(
+                        f"Filtering by conclusions: {', '.join(sorted(self.conclusions))}"
+                    )
         except subprocess.CalledProcessError as e:
             detail = (e.stderr or str(e)).strip()
             self.log_signal.emit(f"Error fetching runs: {detail}")
@@ -274,7 +322,9 @@ class CleanupWorker(QThread):
             for run_id in delete_ids:
                 if not self._wait_if_paused():
                     break
-                ok, detail = delete_run(self.repo, run_id, self.delete_timeout)
+                ok, detail = delete_run(
+                    self.repo, run_id, self.delete_timeout, self.log_signal
+                )
                 done += 1
                 if ok:
                     self.log_signal.emit(f"  Deleted run {run_id}")
@@ -294,7 +344,9 @@ class CleanupWorker(QThread):
                 if not self._wait_if_paused():
                     break
                 batch = delete_ids[start : start + batch_size]
-                results = delete_runs_batch(self.repo, batch, self.delete_timeout)
+                results = delete_runs_batch(
+                    self.repo, batch, self.delete_timeout, self.log_signal
+                )
                 for run_id, ok, detail in results:
                     done += 1
                     if ok:

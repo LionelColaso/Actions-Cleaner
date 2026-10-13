@@ -7,6 +7,7 @@ import subprocess
 from datetime import UTC, datetime
 from typing import Any, TypedDict, cast
 
+from .gh_retry import run_gh_with_retry
 from .repo import is_valid_repo
 
 
@@ -28,6 +29,22 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 #: Run conclusions treated as "failed" by the failed-only filter.
 FAILED_CONCLUSIONS = frozenset({"failure", "cancelled", "timed_out", "startup_failure"})
+
+#: All known GitHub Actions workflow run conclusions.
+ALL_CONCLUSIONS = frozenset(
+    {
+        "success",
+        "failure",
+        "cancelled",
+        "skipped",
+        "timed_out",
+        "startup_failure",
+        "action_required",
+        "stale",
+        "neutral",
+        "",
+    }
+)
 
 #: Granularity of one `gh run list` page; total fetch capped by `fetch_limit`.
 GH_PAGE_SIZE = 100
@@ -69,6 +86,7 @@ def list_runs(
     fetch_limit: int = FETCH_LIMIT_DEFAULT,
     workflow: str = "",
     timeout: int = 60,
+    log_signal: object = None,
 ) -> list[RunInfo]:
     """Fetch up to `fetch_limit` most-recent workflow runs for `repo`.
 
@@ -94,13 +112,20 @@ def list_runs(
     ]
     if workflow:
         cmd.extend(["--workflow", workflow])
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=timeout,
-    )
+
+    from PySide6.QtCore import Signal
+
+    result = run_gh_with_retry(cmd, timeout, log_signal or Signal(str))
+    if result is None:
+        raise subprocess.CalledProcessError(
+            -1, cmd, "failed after retries or cancelled"
+        )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if not detail:
+            detail = f"exit code {result.returncode}"
+        raise subprocess.CalledProcessError(result.returncode, cmd, detail)
+
     data: Any = json.loads(result.stdout)
     if not isinstance(data, list):
         raise TypeError(
@@ -126,6 +151,15 @@ def list_runs(
 def filter_failed_runs(runs: list[RunInfo]) -> list[RunInfo]:
     """Keep only runs whose conclusion counts as failed."""
     return [run for run in runs if run["conclusion"] in FAILED_CONCLUSIONS]
+
+
+def filter_runs_by_conclusions(
+    runs: list[RunInfo], conclusions: set[str] | frozenset[str]
+) -> list[RunInfo]:
+    """Keep only runs whose conclusion is in the given set."""
+    if not conclusions:
+        return runs
+    return [run for run in runs if run["conclusion"] in conclusions]
 
 
 def select_runs_to_delete(

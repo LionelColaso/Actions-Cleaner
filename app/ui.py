@@ -7,7 +7,9 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Callable
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QCloseEvent, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,6 +20,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -29,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from .icon import load_app_icon
 from .repo import is_valid_repo, normalize_repo
+from .selection import ALL_CONCLUSIONS
 from .settings import (
     CONCURRENCY_DEFAULT,
     CONCURRENCY_MAX,
@@ -81,6 +86,34 @@ class MainWindow(QWidget):
             auth_timeout,
             dark_mode,
         ) = load_preferences()
+        self._apply_preferences(
+            keep,
+            failed_only,
+            fetch_limit,
+            max_deletions,
+            last_repo,
+            concurrency,
+            list_timeout,
+            delete_timeout,
+            auth_timeout,
+            dark_mode,
+        )
+        self._refresh_cleanup_enabled()
+
+    def _apply_preferences(
+        self,
+        keep: int,
+        failed_only: bool,
+        fetch_limit: int,
+        max_deletions: int,
+        last_repo: str,
+        concurrency: int,
+        list_timeout: int,
+        delete_timeout: int,
+        auth_timeout: int,
+        dark_mode: bool,
+    ) -> None:
+        """Apply loaded preferences to UI controls."""
         self.keep_spin.setValue(keep)
         self.failed_only_check.setChecked(failed_only)
         self.fetch_limit_spin.setValue(fetch_limit)
@@ -94,7 +127,6 @@ class MainWindow(QWidget):
             self.toggle_dark_mode(True)
         if last_repo:
             self.repo_input.setText(last_repo)
-        self._refresh_cleanup_enabled()
 
     def setup_ui(self) -> None:
         form = QGroupBox("Settings")
@@ -179,6 +211,22 @@ class MainWindow(QWidget):
 
         self.failed_only_check = QCheckBox("Failed / cancelled only")
         form_layout.addRow("", self.failed_only_check)
+
+        self.conclusion_filter_widget = QListWidget()
+        self.conclusion_filter_widget.setSelectionMode(
+            QListWidget.SelectionMode.MultiSelection
+        )
+        self.conclusion_filter_widget.setMaximumHeight(120)
+        self.conclusion_filter_widget.setToolTip(
+            "Select which run conclusions to include (empty = all conclusions). "
+            "Ctrl+click to multi-select."
+        )
+        for conclusion in sorted(ALL_CONCLUSIONS):
+            item = QListWidgetItem(conclusion if conclusion else "(empty)")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.conclusion_filter_widget.addItem(item)
+        form_layout.addRow("Conclusions filter:", self.conclusion_filter_widget)
 
         self.dark_mode_check = QCheckBox("Dark mode")
         self.dark_mode_check.setToolTip("Enable dark mode (requires app restart)")
@@ -375,19 +423,18 @@ class MainWindow(QWidget):
             QMessageBox.critical(self, "Error", "Failed to save imported preferences.")
             return
         self.load_repo_list()
-        self.keep_spin.setValue(keep)
-        self.failed_only_check.setChecked(failed_only)
-        self.fetch_limit_spin.setValue(fetch_limit)
-        self.max_deletions_spin.setValue(max_deletions)
-        self.concurrency_spin.setValue(concurrency)
-        self.list_timeout_spin.setValue(list_timeout)
-        self.delete_timeout_spin.setValue(delete_timeout)
-        self.auth_timeout_spin.setValue(auth_timeout)
-        self.dark_mode_check.setChecked(dark_mode)
-        if dark_mode:
-            self.toggle_dark_mode(True)
-        if last_repo:
-            self.repo_input.setText(last_repo)
+        self._apply_preferences(
+            keep,
+            failed_only,
+            fetch_limit,
+            max_deletions,
+            last_repo,
+            concurrency,
+            list_timeout,
+            delete_timeout,
+            auth_timeout,
+            dark_mode,
+        )
         QMessageBox.information(
             self,
             "Success",
@@ -440,17 +487,22 @@ class MainWindow(QWidget):
         self.load_repo_list()
         self.repo_input.setText(self._repos[0] if self._repos else "")
 
-    def start_cleanup(self) -> None:
-        repo = normalize_repo(self.repo_input.text())
-        if not is_valid_repo(repo):
+    def _validate_and_prepare_cleanup(self, repo: str | None = None) -> bool:
+        """Validate preconditions for starting cleanup. Returns True if OK to proceed."""
+        if repo is not None and not repo:
             QMessageBox.warning(
                 self,
                 "Validation Error",
                 "Please enter a repository as owner/repo or a GitHub URL.",
             )
-            return
-        if self.repo_input.text().strip() != repo:
-            self.repo_input.setText(repo)  # keep the canonical slug visible
+            return False
+        if repo is not None and not is_valid_repo(repo):
+            QMessageBox.warning(
+                self,
+                "Validation Error",
+                "Please enter a repository as owner/repo or a GitHub URL.",
+            )
+            return False
         if shutil.which("gh") is None:
             QMessageBox.warning(
                 self,
@@ -458,12 +510,35 @@ class MainWindow(QWidget):
                 "The `gh` CLI was not found on PATH.\n"
                 "Install it from https://cli.github.com/ and run `gh auth login`.",
             )
-            return
-        if self.worker is not None:
+            return False
+        return self.worker is None
+
+    def start_cleanup(self) -> None:
+        repo = normalize_repo(self.repo_input.text())
+        if self.repo_input.text().strip() != repo:
+            self.repo_input.setText(repo)  # keep the canonical slug visible
+        if not self._validate_and_prepare_cleanup(repo):
             return
 
-        self._cancelled = False
         dry_run = self.dry_run_check.isChecked()
+        self._init_cleanup(dry_run=dry_run, repo_for_prefs=repo)
+
+        selected_conclusions = self._get_selected_conclusions()
+
+        self.worker = self._create_worker(
+            repo=repo,
+            dry_run=dry_run,
+            conclusions=selected_conclusions,
+        )
+        self._connect_worker_signals(
+            on_summary=self.on_summary, on_completion=self.on_cleanup_finished
+        )
+        self.worker.start()
+        self._refresh_cleanup_enabled()
+
+    def _init_cleanup(self, dry_run: bool, repo_for_prefs: str) -> None:
+        """Initialize common cleanup state and UI."""
+        self._cancelled = False
         self._last_dry_run = dry_run
         self._run_started = time.monotonic()
         self._last_summary = (0, 0, 0)
@@ -474,7 +549,7 @@ class MainWindow(QWidget):
             self.failed_only_check.isChecked(),
             self.fetch_limit_spin.value(),
             self.max_deletions_spin.value(),
-            repo,
+            repo_for_prefs,
             self.concurrency_spin.value(),
             self.list_timeout_spin.value(),
             self.delete_timeout_spin.value(),
@@ -491,27 +566,67 @@ class MainWindow(QWidget):
         self.pause_btn.setEnabled(True)
         self.pause_btn.setText("Pause")
 
-        self.worker = CleanupWorker(
+    def _get_selected_conclusions(self) -> set[str]:
+        """Extract selected conclusions from the filter widget."""
+        selected = {
+            self.conclusion_filter_widget.item(i).text()
+            for i in range(self.conclusion_filter_widget.count())
+            if self.conclusion_filter_widget.item(i).checkState()
+            == Qt.CheckState.Checked
+        }
+        # Convert "(empty)" back to empty string
+        return {"" if c == "(empty)" else c for c in selected}
+
+    def _create_worker(
+        self,
+        repo: str,
+        dry_run: bool,
+        conclusions: set[str],
+        *,
+        max_deletions: int | None = None,
+        workflow: str = "",
+    ) -> CleanupWorker:
+        """Create a CleanupWorker with current UI settings."""
+        return CleanupWorker(
             repo,
             self.keep_spin.value(),
             dry_run,
             self.failed_only_check.isChecked(),
             fetch_limit=self.fetch_limit_spin.value(),
-            max_deletions=self.max_deletions_spin.value(),
-            workflow=self.workflow_input.text(),
+            max_deletions=self.max_deletions_spin.value()
+            if max_deletions is None
+            else max_deletions,
+            workflow=workflow or self.workflow_input.text(),
             concurrency=self.concurrency_spin.value(),
             list_timeout=self.list_timeout_spin.value(),
             delete_timeout=self.delete_timeout_spin.value(),
             auth_timeout=self.auth_timeout_spin.value(),
             older_than_days=self.older_than_spin.value(),
+            conclusions=conclusions,
         )
+
+    def _connect_worker_signals(
+        self,
+        on_summary: Callable[[int, int, int], None],
+        on_completion: Callable[[int, int, int, int], None],
+    ) -> None:
+        """Connect worker signals to the given handlers."""
+        assert self.worker is not None
         self.worker.log_signal.connect(self.log_output.appendPlainText)
         self.worker.max_signal.connect(self.progress_bar.setMaximum)
         self.worker.progress_signal.connect(self.progress_bar.setValue)
-        self.worker.summary_signal.connect(self.on_summary)
-        self.worker.completion_signal.connect(self.on_cleanup_finished)
+        self.worker.summary_signal.connect(on_summary)
+        self.worker.completion_signal.connect(on_completion)
         self.worker.finished.connect(self.on_thread_finished)
-        self.worker.start()
+
+    def _reset_cleanup_ui(self) -> None:
+        """Reset UI state after cleanup finishes (single or multi-repo)."""
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.setEnabled(True)
+        self.pause_btn.setVisible(False)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("Pause")
+        self.progress_bar.setVisible(False)
         self._refresh_cleanup_enabled()
 
     def start_cleanup_all(self) -> None:
@@ -519,44 +634,13 @@ class MainWindow(QWidget):
         if not self._repos:
             QMessageBox.information(self, "Info", "No saved repositories to clean.")
             return
-        if shutil.which("gh") is None:
-            QMessageBox.warning(
-                self,
-                "Missing Dependency",
-                "The `gh` CLI was not found on PATH.\n"
-                "Install it from https://cli.github.com/ and run `gh auth login`.",
-            )
-            return
-        if self.worker is not None:
+        if not self._validate_and_prepare_cleanup():
             return
 
         dry_run = self.dry_run_check.isChecked()
-        self._last_dry_run = dry_run
-        self._run_started = time.monotonic()
-        self._last_summary = (0, 0, 0)
-        self.log_output.clear()
-        self.summary_label.setVisible(False)
-        if not save_preferences(
-            self.keep_spin.value(),
-            self.failed_only_check.isChecked(),
-            self.fetch_limit_spin.value(),
-            self.max_deletions_spin.value(),
-            self._repos[0] if self._repos else "",
-            self.concurrency_spin.value(),
-            self.list_timeout_spin.value(),
-            self.delete_timeout_spin.value(),
-            self.auth_timeout_spin.value(),
-            self.dark_mode_check.isChecked(),
-        ):
-            self.log_output.appendPlainText("Warning: could not write preferences file")
-
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.cancel_btn.setVisible(True)
-        self.cancel_btn.setEnabled(True)
-        self.pause_btn.setVisible(True)
-        self.pause_btn.setEnabled(True)
-        self.pause_btn.setText("Pause")
+        self._init_cleanup(
+            dry_run=dry_run, repo_for_prefs=self._repos[0] if self._repos else ""
+        )
 
         self._cleanup_all_repos = list(self._repos)
         self._cleanup_all_index = 0
@@ -578,26 +662,17 @@ class MainWindow(QWidget):
         )
         self.repo_input.setText(repo)
 
-        self.worker = CleanupWorker(
-            repo,
-            self.keep_spin.value(),
-            self._cleanup_all_dry_run,
-            self.failed_only_check.isChecked(),
-            fetch_limit=self.fetch_limit_spin.value(),
-            max_deletions=self.max_deletions_spin.value(),
-            workflow=self.workflow_input.text(),
-            concurrency=self.concurrency_spin.value(),
-            list_timeout=self.list_timeout_spin.value(),
-            delete_timeout=self.delete_timeout_spin.value(),
-            auth_timeout=self.auth_timeout_spin.value(),
-            older_than_days=self.older_than_spin.value(),
+        selected_conclusions = self._get_selected_conclusions()
+
+        self.worker = self._create_worker(
+            repo=repo,
+            dry_run=self._cleanup_all_dry_run,
+            conclusions=selected_conclusions,
         )
-        self.worker.log_signal.connect(self.log_output.appendPlainText)
-        self.worker.max_signal.connect(self.progress_bar.setMaximum)
-        self.worker.progress_signal.connect(self.progress_bar.setValue)
-        self.worker.summary_signal.connect(self._on_cleanup_all_summary)
-        self.worker.completion_signal.connect(self._on_cleanup_all_finished)
-        self.worker.finished.connect(self.on_thread_finished)
+        self._connect_worker_signals(
+            on_summary=self._on_cleanup_all_summary,
+            on_completion=self._on_cleanup_all_finished,
+        )
         self.worker.start()
 
     def _on_cleanup_all_summary(self, kept: int, deleted: int, failed: int) -> None:
@@ -618,13 +693,7 @@ class MainWindow(QWidget):
 
     def _finish_cleanup_all(self) -> None:
         """Finalize multi-repo cleanup and show summary."""
-        self.cancel_btn.setVisible(False)
-        self.cancel_btn.setEnabled(True)
-        self.pause_btn.setVisible(False)
-        self.pause_btn.setEnabled(True)
-        self.pause_btn.setText("Pause")
-        self.progress_bar.setVisible(False)
-        self._refresh_cleanup_enabled()
+        self._reset_cleanup_ui()
 
         elapsed = time.monotonic() - self._run_started if self._run_started else 0.0
         if self._cancelled:
@@ -790,13 +859,7 @@ class MainWindow(QWidget):
         self, result: int, kept: int, deleted: int, failed: int
     ) -> None:
         """Reset UI state and report the outcome (0 ok, 1 fail, 2 cancel)."""
-        self.cancel_btn.setVisible(False)
-        self.cancel_btn.setEnabled(True)
-        self.pause_btn.setVisible(False)
-        self.pause_btn.setEnabled(True)
-        self.pause_btn.setText("Pause")
-        self.progress_bar.setVisible(False)
-        self._refresh_cleanup_enabled()
+        self._reset_cleanup_ui()
 
         elapsed = time.monotonic() - self._run_started if self._run_started else 0.0
         if self._last_dry_run:

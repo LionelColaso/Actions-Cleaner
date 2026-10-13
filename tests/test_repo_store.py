@@ -21,6 +21,8 @@ from app.settings import (
     TIMEOUT_LIST_DEFAULT,
     TIMEOUT_MAX,
     TIMEOUT_MIN,
+    export_settings,
+    import_settings,
     load_preferences,
     load_repos,
     save_preferences,
@@ -399,3 +401,275 @@ def test_save_preferences_failure_returns_false(
     target.mkdir()
     monkeypatch.setattr("app.settings.PREFERENCES_PATH", str(target))
     assert not save_preferences(2, False)
+
+
+# --- export_settings / import_settings --------------------------------------
+
+
+def test_export_settings_writes_json(
+    tmp_path: Path, settings_paths: tuple[Path, Path]
+) -> None:
+    """export_settings writes a valid JSON file with repos and preferences."""
+    _repos_path, _prefs_path = settings_paths
+    # Set up some data
+    save_repos(["owner/repo1", "owner/repo2"])
+    save_preferences(5, True, 500, 100, "owner/repo1", 4, 120, 60, 30, True)
+
+    export_path = tmp_path / "export.json"
+    assert export_settings(str(export_path))
+
+    import json
+
+    data = json.loads(export_path.read_text(encoding="utf-8"))
+    assert data["version"] == 1
+    assert data["repos"] == ["owner/repo1", "owner/repo2"]
+    prefs = data["preferences"]
+    assert prefs["keep"] == 5
+    assert prefs["failed_only"] is True
+    assert prefs["fetch_limit"] == 500
+    assert prefs["max_deletions"] == 100
+    assert prefs["last_repo"] == "owner/repo1"
+    assert prefs["concurrency"] == 4
+    assert prefs["list_timeout"] == 120
+    assert prefs["delete_timeout"] == 60
+    assert prefs["auth_timeout"] == 30
+    assert prefs["dark_mode"] is True
+
+
+def test_export_settings_failure_returns_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """export_settings returns False on I/O failure."""
+    target = tmp_path / "export-dir"
+    target.mkdir()
+    monkeypatch.setattr("app.settings.SETTINGS_PATH", str(tmp_path / "repos.json"))
+    monkeypatch.setattr("app.settings.PREFERENCES_PATH", str(tmp_path / "prefs.json"))
+    assert not export_settings(str(target))
+
+
+def test_import_settings_valid_file(
+    tmp_path: Path, settings_paths: tuple[Path, Path]
+) -> None:
+    """import_settings reads a valid export file and returns (repos, prefs)."""
+    import json
+
+    export_path = tmp_path / "import.json"
+    export_data = {
+        "version": 1,
+        "repos": ["imported/repo1", "imported/repo2"],
+        "preferences": {
+            "keep": 3,
+            "failed_only": True,
+            "fetch_limit": 200,
+            "max_deletions": 50,
+            "last_repo": "imported/repo1",
+            "concurrency": 2,
+            "list_timeout": 90,
+            "delete_timeout": 45,
+            "auth_timeout": 20,
+            "dark_mode": True,
+        },
+    }
+    export_path.write_text(json.dumps(export_data), encoding="utf-8")
+
+    result = import_settings(str(export_path))
+    assert result is not None
+    repos, prefs = result
+    assert repos == ["imported/repo1", "imported/repo2"]
+    (
+        keep,
+        failed_only,
+        fetch_limit,
+        max_deletions,
+        last_repo,
+        concurrency,
+        list_timeout,
+        delete_timeout,
+        auth_timeout,
+        dark_mode,
+    ) = prefs
+    assert keep == 3
+    assert failed_only is True
+    assert fetch_limit == 200
+    assert max_deletions == 50
+    assert last_repo == "imported/repo1"
+    assert concurrency == 2
+    assert list_timeout == 90
+    assert delete_timeout == 45
+    assert auth_timeout == 20
+    assert dark_mode is True
+
+
+def test_import_settings_missing_file_returns_none(
+    tmp_path: Path, settings_paths: tuple[Path, Path]
+) -> None:
+    """import_settings returns None for non-existent file."""
+    result = import_settings(str(tmp_path / "nonexistent.json"))
+    assert result is None
+
+
+def test_import_settings_corrupt_json_returns_none(
+    tmp_path: Path, settings_paths: tuple[Path, Path]
+) -> None:
+    """import_settings returns None for corrupt JSON."""
+    export_path = tmp_path / "corrupt.json"
+    export_path.write_text("{not json", encoding="utf-8")
+    result = import_settings(str(export_path))
+    assert result is None
+
+
+def test_import_settings_wrong_version_returns_none(
+    tmp_path: Path, settings_paths: tuple[Path, Path]
+) -> None:
+    """import_settings returns None for wrong version."""
+    import json
+
+    export_path = tmp_path / "wrong_version.json"
+    export_path.write_text(
+        json.dumps({"version": 2, "repos": [], "preferences": {}}), encoding="utf-8"
+    )
+    result = import_settings(str(export_path))
+    assert result is None
+
+
+def test_import_settings_non_list_repos_returns_none(
+    tmp_path: Path, settings_paths: tuple[Path, Path]
+) -> None:
+    """import_settings returns None when repos is not a list."""
+    import json
+
+    export_path = tmp_path / "bad_repos.json"
+    export_path.write_text(
+        json.dumps({"version": 1, "repos": "not-a-list", "preferences": {}}),
+        encoding="utf-8",
+    )
+    result = import_settings(str(export_path))
+    assert result is None
+
+
+def test_import_settings_non_dict_preferences_returns_none(
+    tmp_path: Path, settings_paths: tuple[Path, Path]
+) -> None:
+    """import_settings returns None when preferences is not a dict."""
+    import json
+
+    export_path = tmp_path / "bad_prefs.json"
+    export_path.write_text(
+        json.dumps({"version": 1, "repos": [], "preferences": "not-a-dict"}),
+        encoding="utf-8",
+    )
+    result = import_settings(str(export_path))
+    assert result is None
+
+
+def test_import_settings_filters_invalid_repos(
+    tmp_path: Path, settings_paths: tuple[Path, Path]
+) -> None:
+    """import_settings filters out invalid repo entries."""
+    import json
+
+    export_path = tmp_path / "mixed_repos.json"
+    export_data = {
+        "version": 1,
+        "repos": ["valid/repo", "", "also-valid/repo", 123, None, "valid/repo"],
+        "preferences": {},
+    }
+    export_path.write_text(json.dumps(export_data), encoding="utf-8")
+
+    result = import_settings(str(export_path))
+    assert result is not None
+    repos, _ = result
+    # Should only include valid, non-empty, unique repos
+    assert repos == ["valid/repo", "also-valid/repo"]
+
+
+def test_import_settings_uses_defaults_for_missing_prefs(
+    tmp_path: Path, settings_paths: tuple[Path, Path]
+) -> None:
+    """import_settings uses defaults for missing preference fields."""
+    import json
+
+    export_path = tmp_path / "minimal_prefs.json"
+    export_path.write_text(
+        json.dumps({"version": 1, "repos": ["a/b"], "preferences": {}}),
+        encoding="utf-8",
+    )
+
+    result = import_settings(str(export_path))
+    assert result is not None
+    _, prefs = result
+    (
+        keep,
+        failed_only,
+        fetch_limit,
+        max_deletions,
+        last_repo,
+        concurrency,
+        list_timeout,
+        delete_timeout,
+        auth_timeout,
+        dark_mode,
+    ) = prefs
+    assert keep == 2
+    assert failed_only is False
+    assert fetch_limit == FETCH_LIMIT_DEFAULT
+    assert max_deletions == 0
+    assert last_repo == ""
+    assert concurrency == CONCURRENCY_DEFAULT
+    assert list_timeout == TIMEOUT_LIST_DEFAULT
+    assert delete_timeout == TIMEOUT_DELETE_DEFAULT
+    assert auth_timeout == TIMEOUT_AUTH_DEFAULT
+    assert dark_mode is False
+
+
+def test_import_settings_rejects_invalid_pref_values(
+    tmp_path: Path, settings_paths: tuple[Path, Path]
+) -> None:
+    """import_settings rejects out-of-range or wrongly-typed preference values."""
+    import json
+
+    export_path = tmp_path / "bad_prefs.json"
+    export_data = {
+        "version": 1,
+        "repos": ["a/b"],
+        "preferences": {
+            "keep": 0,  # out of range
+            "failed_only": "yes",  # wrong type
+            "fetch_limit": FETCH_LIMIT_MAX + 1,  # out of range
+            "max_deletions": -5,  # out of range
+            "last_repo": "not-a-valid-repo",  # invalid
+            "concurrency": 0,  # out of range
+            "list_timeout": 2,  # out of range
+            "delete_timeout": "lots",  # wrong type
+            "auth_timeout": 9999,  # out of range
+            "dark_mode": "yes",  # wrong type
+        },
+    }
+    export_path.write_text(json.dumps(export_data), encoding="utf-8")
+
+    result = import_settings(str(export_path))
+    assert result is not None
+    _, prefs = result
+    (
+        keep,
+        failed_only,
+        fetch_limit,
+        max_deletions,
+        last_repo,
+        concurrency,
+        list_timeout,
+        delete_timeout,
+        auth_timeout,
+        dark_mode,
+    ) = prefs
+    # All should fall back to defaults
+    assert keep == 2
+    assert failed_only is False
+    assert fetch_limit == FETCH_LIMIT_DEFAULT
+    assert max_deletions == 0
+    assert last_repo == ""
+    assert concurrency == CONCURRENCY_DEFAULT
+    assert list_timeout == TIMEOUT_LIST_DEFAULT
+    assert delete_timeout == TIMEOUT_DELETE_DEFAULT
+    assert auth_timeout == TIMEOUT_AUTH_DEFAULT
+    assert dark_mode is False

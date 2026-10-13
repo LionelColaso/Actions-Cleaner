@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import threading
 from collections.abc import Callable
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -14,8 +15,17 @@ from app.settings import (
     CONCURRENCY_MIN,
     TIMEOUT_DELETE_DEFAULT,
     TIMEOUT_LIST_DEFAULT,
+    TIMEOUT_MAX,
+    TIMEOUT_MIN,
 )
-from app.worker import CleanupWorker
+from app.worker import (
+    CleanupWorker,
+    check_gh_auth,
+    check_gh_version,
+    delete_run,
+    delete_runs_batch,
+    get_gh_version,
+)
 
 MakeRun = Callable[..., RunInfo]
 
@@ -69,6 +79,7 @@ class _GhMock:
             fetch_limit: int = 0,
             workflow: str = "",
             timeout: int = TIMEOUT_LIST_DEFAULT,
+            log_signal: object = None,
         ) -> list[RunInfo]:
             self.list_timeout_seen = timeout
             if self.list_error is not None:
@@ -78,7 +89,10 @@ class _GhMock:
             return list(self.runs)
 
         def fake_delete(
-            repo: str, run_id: str, timeout: int = TIMEOUT_DELETE_DEFAULT
+            repo: str,
+            run_id: str,
+            timeout: int = TIMEOUT_DELETE_DEFAULT,
+            log_signal: object = None,
         ) -> tuple[bool, str]:
             self.delete_timeout_seen = timeout
             if self.delete_error is not None:
@@ -87,7 +101,10 @@ class _GhMock:
             return self.delete_ok, self.delete_detail
 
         def fake_batch_delete(
-            repo: str, run_ids: list[str], timeout: int = TIMEOUT_DELETE_DEFAULT
+            repo: str,
+            run_ids: list[str],
+            timeout: int = TIMEOUT_DELETE_DEFAULT,
+            log_signal: object = None,
         ) -> list[tuple[str, bool, str]]:
             self.delete_timeout_seen = timeout
             self.batch_delete_calls.append(list(run_ids))
@@ -437,7 +454,10 @@ def test_concurrency_reports_failed_ids_by_name(
     original_batch_delete = "app.worker.delete_runs_batch"
 
     def flaky_batch_delete(
-        repo: str, run_ids: list[str], timeout: int = TIMEOUT_DELETE_DEFAULT
+        repo: str,
+        run_ids: list[str],
+        timeout: int = TIMEOUT_DELETE_DEFAULT,
+        log_signal: object = None,
     ) -> list[tuple[str, bool, str]]:
         results = []
         for run_id in run_ids:
@@ -508,3 +528,448 @@ def test_cancel_releases_a_paused_worker(
 
     assert result.completions == [(2, 1, 0, 0)]
     assert gh.delete_calls == []
+
+
+# --- get_gh_version ---------------------------------------------------------
+
+
+def test_get_gh_version_success() -> None:
+    with patch("subprocess.run") as mock_run:
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "gh version 2.45.0 (2024-01-15)"
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        version = get_gh_version()
+        assert version == (2, 45)
+
+
+def test_get_gh_version_timeout() -> None:
+    with patch("subprocess.run") as mock_run:
+        mock_run.side_effect = subprocess.TimeoutExpired("gh", 5)
+
+        version = get_gh_version()
+        assert version is None
+
+
+def test_get_gh_version_oserror() -> None:
+    with patch("subprocess.run") as mock_run:
+        mock_run.side_effect = OSError("not found")
+
+        version = get_gh_version()
+        assert version is None
+
+
+def test_get_gh_version_nonzero_exit() -> None:
+    with patch("subprocess.run") as mock_run:
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        mock_result.stderr = "error"
+        mock_run.return_value = mock_result
+
+        version = get_gh_version()
+        assert version is None
+
+
+def test_get_gh_version_unparseable_output() -> None:
+    with patch("subprocess.run") as mock_run:
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "some weird output"
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        version = get_gh_version()
+        assert version is None
+
+
+# --- check_gh_version -------------------------------------------------------
+
+
+def test_check_gh_version_ok() -> None:
+    with patch("app.worker.get_gh_version", return_value=(2, 45)):
+        assert check_gh_version() == ""
+
+
+def test_check_gh_version_not_found() -> None:
+    with patch("app.worker.get_gh_version", return_value=None):
+        msg = check_gh_version()
+        assert "could not determine" in msg
+
+
+def test_check_gh_version_too_old() -> None:
+    with patch("app.worker.get_gh_version", return_value=(1, 9)):
+        msg = check_gh_version()
+        assert "older than minimum" in msg
+        assert "1.9" in msg
+
+
+# --- check_gh_auth ----------------------------------------------------------
+
+
+def test_check_gh_auth_missing() -> None:
+    with patch("shutil.which", return_value=None):
+        msg = check_gh_auth()
+        assert "not found on PATH" in msg
+
+
+def test_check_gh_auth_timeout() -> None:
+    with (
+        patch("shutil.which", return_value="/usr/bin/gh"),
+        patch("subprocess.run") as mock_run,
+    ):
+        mock_run.side_effect = subprocess.TimeoutExpired("gh", 15)
+
+        msg = check_gh_auth()
+        assert "timed out" in msg
+
+
+def test_check_gh_auth_oserror() -> None:
+    with (
+        patch("shutil.which", return_value="/usr/bin/gh"),
+        patch("subprocess.run") as mock_run,
+    ):
+        mock_run.side_effect = OSError("permission denied")
+
+        msg = check_gh_auth()
+        assert "could not run" in msg
+        assert "permission denied" in msg
+
+
+def test_check_gh_auth_not_authenticated() -> None:
+    with (
+        patch("shutil.which", return_value="/usr/bin/gh"),
+        patch("subprocess.run") as mock_run,
+    ):
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        mock_result.stderr = "not logged in"
+        mock_run.return_value = mock_result
+
+        msg = check_gh_auth()
+        assert "not authenticated" in msg
+        assert "gh auth login" in msg
+
+
+def test_check_gh_auth_success() -> None:
+    with (
+        patch("shutil.which", return_value="/usr/bin/gh"),
+        patch("subprocess.run") as mock_run,
+    ):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "Logged in"
+        mock_result.stderr = ""
+        mock_run.return_value = mock_result
+
+        msg = check_gh_auth()
+        assert msg == ""
+
+
+# --- delete_run -------------------------------------------------------------
+
+
+def test_delete_run_success() -> None:
+    with patch("app.worker.run_gh_with_retry") as mock_retry:
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+        mock_retry.return_value = mock_result
+
+        ok, detail = delete_run("owner/repo", "123")
+        assert ok is True
+        assert detail == ""
+        mock_retry.assert_called_once()
+
+
+def test_delete_run_failure() -> None:
+    with patch("app.worker.run_gh_with_retry") as mock_retry:
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        mock_result.stderr = "run not found"
+        mock_retry.return_value = mock_result
+
+        ok, detail = delete_run("owner/repo", "123")
+        assert ok is False
+        assert "run not found" in detail
+
+
+def test_delete_run_retry_exhausted() -> None:
+    with patch("app.worker.run_gh_with_retry") as mock_retry:
+        mock_retry.return_value = None  # All retries exhausted
+
+        ok, detail = delete_run("owner/repo", "123")
+        assert ok is False
+        assert "failed after retries" in detail
+
+
+# --- delete_runs_batch ------------------------------------------------------
+
+
+def test_delete_runs_batch_empty() -> None:
+    results = delete_runs_batch("owner/repo", [])
+    assert results == []
+
+
+def test_delete_runs_batch_success() -> None:
+    with patch("app.worker.run_gh_with_retry") as mock_retry:
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+        mock_result.stderr = ""
+        mock_retry.return_value = mock_result
+
+        results = delete_runs_batch("owner/repo", ["1", "2", "3"])
+        assert len(results) == 3
+        assert all(r[1] is True for r in results)
+
+
+def test_delete_runs_batch_failure() -> None:
+    with patch("app.worker.run_gh_with_retry") as mock_retry:
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+        mock_result.stderr = "batch failed"
+        mock_retry.return_value = mock_result
+
+        results = delete_runs_batch("owner/repo", ["1", "2"])
+        assert len(results) == 2
+        assert all(r[1] is False for r in results)
+        assert all("batch failed" in r[2] for r in results)
+
+
+def test_delete_runs_batch_retry_exhausted() -> None:
+    with patch("app.worker.run_gh_with_retry") as mock_retry:
+        mock_retry.return_value = None  # All retries exhausted
+
+        results = delete_runs_batch("owner/repo", ["1", "2"])
+        assert len(results) == 2
+        assert all(r[1] is False for r in results)
+        assert all("failed after retries" in r[2] for r in results)
+
+
+# --- CleanupWorker with conclusions filter ----------------------------------
+
+
+def test_conclusions_filter_applied_in_worker(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    """When conclusions filter is set, worker applies it before selecting runs."""
+    gh = _GhMock()
+    # Two runs: one success, one failure
+    gh.runs = [
+        make_run(1, "sha1", "2024-06-01T00:00:00Z", "success"),
+        make_run(2, "sha2", "2024-05-01T00:00:00Z", "failure"),
+    ]
+    gh.install(monkeypatch)
+
+    # Filter to only "failure" conclusions
+    worker = CleanupWorker(
+        "owner/repo",
+        keep=1,
+        dry_run=False,
+        conclusions={"failure"},
+    )
+    result = _run_worker(worker)
+
+    # Only the failure run should be considered; it becomes the only commit
+    # So no runs should be deleted (keep=1 protects it)
+    assert result.completions == [(0, 1, 0, 0)]
+    assert result.summaries == [(1, 0, 0)]
+
+
+def test_conclusions_filter_with_multiple_conclusions(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    """Worker respects multiple selected conclusions."""
+    gh = _GhMock()
+    gh.runs = [
+        make_run(1, "sha1", "2024-06-01T00:00:00Z", "success"),
+        make_run(2, "sha2", "2024-05-01T00:00:00Z", "failure"),
+        make_run(3, "sha3", "2024-04-01T00:00:00Z", "cancelled"),
+        make_run(4, "sha4", "2024-03-01T00:00:00Z", "skipped"),
+    ]
+    gh.install(monkeypatch)
+
+    worker = CleanupWorker(
+        "owner/repo",
+        keep=1,
+        dry_run=False,
+        conclusions={"failure", "cancelled"},
+    )
+    result = _run_worker(worker)
+
+    # Only failure and cancelled runs considered; they have different SHAs
+    # keep=1 protects the newest (failure), cancelled gets deleted
+    # kept=1 (run 2), deleted=1 (run 3)
+    assert result.completions == [(0, 1, 1, 0)]
+    assert result.summaries == [(1, 1, 0)]
+    assert gh.delete_calls == ["3"]
+
+
+def test_conclusions_filter_empty_set_means_no_filter(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    """Empty conclusions set means no filter (all conclusions included)."""
+    gh = _GhMock()
+    gh.runs = [
+        make_run(1, "sha1", "2024-06-01T00:00:00Z", "success"),
+        make_run(2, "sha2", "2024-05-01T00:00:00Z", "failure"),
+    ]
+    gh.install(monkeypatch)
+
+    worker = CleanupWorker(
+        "owner/repo",
+        keep=1,
+        dry_run=False,
+        conclusions=set(),  # Empty set = no filter
+    )
+    result = _run_worker(worker)
+
+    # Both runs considered, failure is older and gets deleted
+    assert result.completions == [(0, 1, 1, 0)]
+    assert gh.delete_calls == ["2"]
+
+
+def test_conclusions_filter_none_means_all(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    """None conclusions means all conclusions included (default behavior)."""
+    gh = _GhMock()
+    gh.runs = [
+        make_run(1, "sha1", "2024-06-01T00:00:00Z", "success"),
+        make_run(2, "sha2", "2024-05-01T00:00:00Z", "failure"),
+    ]
+    gh.install(monkeypatch)
+
+    worker = CleanupWorker(
+        "owner/repo",
+        keep=1,
+        dry_run=False,
+        conclusions=None,  # None = all
+    )
+    result = _run_worker(worker)
+
+    # Both runs considered
+    assert result.completions == [(0, 1, 1, 0)]
+    assert gh.delete_calls == ["2"]
+
+
+# --- CleanupWorker with older_than_days -------------------------------------
+
+
+def test_older_than_days_filter_in_worker(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    """Worker respects older_than_days filter."""
+    from datetime import UTC, datetime, timedelta
+
+    old_date = (
+        (datetime.now(UTC) - timedelta(days=10)).isoformat().replace("+00:00", "Z")
+    )
+    new_date = (
+        (datetime.now(UTC) - timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    )
+
+    gh = _GhMock()
+    gh.runs = [
+        make_run(1, "old_sha", old_date, "success"),
+        make_run(2, "new_sha", new_date, "success"),
+    ]
+    gh.install(monkeypatch)
+
+    # Only consider runs older than 5 days
+    worker = CleanupWorker(
+        "owner/repo",
+        keep=1,
+        dry_run=False,
+        older_than_days=5,
+    )
+    result = _run_worker(worker)
+
+    # Only the old run is considered; it's the only commit so it's kept
+    assert result.completions == [(0, 1, 0, 0)]
+    assert result.summaries == [(1, 0, 0)]
+    assert gh.delete_calls == []
+
+
+def test_older_than_days_zero_disabled(
+    monkeypatch: pytest.MonkeyPatch, make_run: MakeRun
+) -> None:
+    """older_than_days=0 means disabled (all runs considered)."""
+    gh = _GhMock()
+    gh.runs = [
+        make_run(1, "old_sha", "2024-05-01T00:00:00Z", "success"),
+        make_run(2, "new_sha", "2024-06-01T00:00:00Z", "success"),
+    ]
+    gh.install(monkeypatch)
+
+    worker = CleanupWorker(
+        "owner/repo",
+        keep=1,
+        dry_run=False,
+        older_than_days=0,
+    )
+    result = _run_worker(worker)
+
+    # Both runs considered; old_sha is older and gets deleted
+    assert result.completions == [(0, 1, 1, 0)]
+    assert gh.delete_calls == ["1"]
+
+
+# --- CleanupWorker timeout clamping -----------------------------------------
+
+
+def test_worker_clamps_timeouts_to_bounds() -> None:
+    worker = CleanupWorker(
+        "owner/repo",
+        keep=1,
+        dry_run=True,
+        list_timeout=1,  # below TIMEOUT_MIN
+        delete_timeout=1,
+        auth_timeout=1,
+    )
+    assert worker.list_timeout == TIMEOUT_MIN
+    assert worker.delete_timeout == TIMEOUT_MIN
+    assert worker.auth_timeout == TIMEOUT_MIN
+
+    worker = CleanupWorker(
+        "owner/repo",
+        keep=1,
+        dry_run=True,
+        list_timeout=9999,  # above TIMEOUT_MAX
+        delete_timeout=9999,
+        auth_timeout=9999,
+    )
+    assert worker.list_timeout == TIMEOUT_MAX
+    assert worker.delete_timeout == TIMEOUT_MAX
+    assert worker.auth_timeout == TIMEOUT_MAX
+
+
+# --- CleanupWorker fetch_limit clamping -------------------------------------
+
+
+def test_worker_clamps_fetch_limit_to_bounds() -> None:
+    from app.settings import FETCH_LIMIT_MAX, FETCH_LIMIT_MIN
+
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True, fetch_limit=1)
+    assert worker.fetch_limit == FETCH_LIMIT_MIN
+
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True, fetch_limit=99999)
+    assert worker.fetch_limit == FETCH_LIMIT_MAX
+
+
+# --- CleanupWorker max_deletions clamping -----------------------------------
+
+
+def test_worker_clamps_max_deletions_to_non_negative() -> None:
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True, max_deletions=-10)
+    assert worker.max_deletions == 0
+
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True, max_deletions=100)
+    assert worker.max_deletions == 100

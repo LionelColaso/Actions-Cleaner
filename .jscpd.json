@@ -12,8 +12,6 @@
     "**/*.md",
     "**/docs/**",
     "coverage.xml",
-    ".coverage",
-    "tests/**",
-    "scripts/**"
+    ".coverage"
   ]
 }
