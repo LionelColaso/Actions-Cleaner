@@ -22,6 +22,21 @@ RETRY_BASE_DELAY = 1.0
 #: Max delay for exponential backoff (seconds)
 RETRY_MAX_DELAY = 30.0
 
+#: Common gh error patterns mapped to user-friendly messages
+GH_ERROR_MESSAGES: dict[str, str] = {
+    "run not found": "Run not found — it may have already been deleted",
+    "not found": "Resource not found — check the repository name and run ID",
+    "permission denied": "Permission denied — ensure you have admin access to the repository",
+    "unauthorized": "Authentication failed — run `gh auth login`",
+    "bad credentials": "Invalid credentials — run `gh auth login` to re-authenticate",
+    "rate limit": "Rate limited — wait for reset or increase delay between calls",
+    "could not resolve host": "Network error — check your internet connection",
+    "connection refused": "Connection refused — check network/firewall settings",
+    "timeout": "Request timed out — try increasing the timeout setting",
+    "graphql": "GraphQL error — may be a temporary GitHub API issue",
+    "validation failed": "Invalid request — check the repository and workflow names",
+}
+
 
 def _parse_rate_limit_reset(stderr: str) -> float | None:
     """Parse rate limit reset timestamp from stderr; return wait time in seconds or None."""
@@ -138,3 +153,23 @@ def run_gh_with_retry(
         return result
 
     return None
+
+
+def get_friendly_error_message(stderr: str, stdout: str = "") -> str:
+    """
+    Map common gh CLI error output to user-friendly guidance.
+
+    Args:
+        stderr: Standard error output from gh command
+        stdout: Standard output from gh command
+
+    Returns:
+        User-friendly error message, or the original error if no mapping found
+    """
+    combined = (stderr + "\n" + stdout).lower()
+    for pattern, message in GH_ERROR_MESSAGES.items():
+        if pattern in combined:
+            return message
+    # Return original error (truncated) if no friendly mapping found
+    original = (stderr or stdout or "").strip()
+    return original if original else "Unknown error"

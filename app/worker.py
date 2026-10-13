@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from .gh_retry import run_gh_with_retry
+from .gh_retry import get_friendly_error_message, run_gh_with_retry
 from .selection import (
     ALL_CONCLUSIONS,
     filter_failed_runs,
@@ -44,12 +47,72 @@ GH_AUTH_TIMEOUT = 15
 
 DRY_RUN_PROGRESS_STEP = 25
 
+#: Cache for gh auth status per session
+_gh_auth_cache: dict[str, str] = {}
+
+
+def clear_gh_auth_cache() -> None:
+    """Clear the gh auth status cache (useful for testing)."""
+    _gh_auth_cache.clear()
+
+
+def _find_gh_on_path() -> str | None:
+    """Find gh CLI executable, checking common install locations if not on PATH."""
+    # First try PATH
+    gh_path = shutil.which("gh")
+    if gh_path:
+        return gh_path
+
+    # Common install locations
+    candidates: list[Path] = []
+
+    if sys.platform == "win32":
+        # Windows: GitHub CLI installer locations
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        if local_app_data:
+            candidates.append(Path(local_app_data) / "GitHub CLI" / "gh.exe")
+        program_files = os.environ.get("PROGRAMFILES", "")
+        if program_files:
+            candidates.append(Path(program_files) / "GitHub CLI" / "gh.exe")
+        # Scoop/Chocolatey
+        user_profile = os.environ.get("USERPROFILE", "")
+        if user_profile:
+            candidates.append(
+                Path(user_profile)
+                / "scoop"
+                / "apps"
+                / "gh"
+                / "current"
+                / "bin"
+                / "gh.exe"
+            )
+            candidates.append(Path(user_profile) / ".chocolatey" / "bin" / "gh.exe")
+    else:
+        # macOS/Linux: Homebrew, apt, etc.
+        candidates.extend(
+            [
+                Path("/usr/local/bin/gh"),
+                Path("/opt/homebrew/bin/gh"),
+                Path("/usr/bin/gh"),
+                Path.home() / ".local" / "bin" / "gh",
+            ]
+        )
+
+    for candidate in candidates:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    return None
+
 
 def get_gh_version() -> tuple[int, int] | None:
     """Return parsed (major, minor) version of gh CLI, or None if unavailable."""
+    gh_path = _find_gh_on_path()
+    if gh_path is None:
+        return None
     try:
         result = subprocess.run(
-            ["gh", "version"],
+            [gh_path, "version"],
             capture_output=True,
             text=True,
             check=False,
@@ -77,26 +140,45 @@ def check_gh_version() -> str:
 
 
 def check_gh_auth(timeout: int = GH_AUTH_TIMEOUT) -> str:
-    """Preflight `gh`; return an error message or "" when ready to go."""
-    if shutil.which("gh") is None:
-        return (
+    """Preflight `gh`; return an error message or "" when ready to go.
+
+    Uses a simple session cache to avoid repeated auth checks.
+    """
+    # Check cache first
+    cache_key = f"auth_{timeout}"
+    if cache_key in _gh_auth_cache:
+        return _gh_auth_cache[cache_key]
+
+    gh_path = _find_gh_on_path()
+    if gh_path is None:
+        error = (
             "the `gh` CLI was not found on PATH (install from https://cli.github.com/)"
         )
+        _gh_auth_cache[cache_key] = error
+        return error
+
     try:
         result = subprocess.run(
-            ["gh", "auth", "status"],
+            [gh_path, "auth", "status"],
             capture_output=True,
             text=True,
             check=False,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return "`gh auth status` timed out"
+        error = "`gh auth status` timed out"
+        _gh_auth_cache[cache_key] = error
+        return error
     except OSError as e:
-        return f"could not run `gh`: {e}"
+        error = f"could not run `gh`: {e}"
+        _gh_auth_cache[cache_key] = error
+        return error
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        return f"`gh` is not authenticated — run `gh auth login`. {detail}".strip()
+        error = f"`gh` is not authenticated — run `gh auth login`. {detail}".strip()
+        _gh_auth_cache[cache_key] = error
+        return error
+    _gh_auth_cache[cache_key] = ""
     return ""
 
 
@@ -114,7 +196,7 @@ def delete_run(
     if result is None:
         return False, "failed after retries or cancelled"
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
+        detail = get_friendly_error_message(result.stderr or "", result.stdout or "")
         if not detail:
             detail = f"exit code {result.returncode}"
         return False, detail
@@ -142,7 +224,7 @@ def delete_runs_batch(
             (run_id, False, "failed after retries or cancelled") for run_id in run_ids
         ]
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
+        detail = get_friendly_error_message(result.stderr or "", result.stdout or "")
         if not detail:
             detail = f"exit code {result.returncode}"
         return [(run_id, False, detail) for run_id in run_ids]

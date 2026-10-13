@@ -22,6 +22,7 @@ from app.worker import (
     CleanupWorker,
     check_gh_auth,
     check_gh_version,
+    clear_gh_auth_cache,
     delete_run,
     delete_runs_batch,
     get_gh_version,
@@ -610,14 +611,17 @@ def test_check_gh_version_too_old() -> None:
 
 
 def test_check_gh_auth_missing() -> None:
-    with patch("shutil.which", return_value=None):
+    clear_gh_auth_cache()
+    with patch("app.worker._find_gh_on_path", return_value=None):
         msg = check_gh_auth()
-        assert "not found on PATH" in msg
+        assert "not found" in msg
+        assert "cli.github.com" in msg
 
 
 def test_check_gh_auth_timeout() -> None:
+    clear_gh_auth_cache()
     with (
-        patch("shutil.which", return_value="/usr/bin/gh"),
+        patch("app.worker._find_gh_on_path", return_value="/usr/bin/gh"),
         patch("subprocess.run") as mock_run,
     ):
         mock_run.side_effect = subprocess.TimeoutExpired("gh", 15)
@@ -627,8 +631,9 @@ def test_check_gh_auth_timeout() -> None:
 
 
 def test_check_gh_auth_oserror() -> None:
+    clear_gh_auth_cache()
     with (
-        patch("shutil.which", return_value="/usr/bin/gh"),
+        patch("app.worker._find_gh_on_path", return_value="/usr/bin/gh"),
         patch("subprocess.run") as mock_run,
     ):
         mock_run.side_effect = OSError("permission denied")
@@ -639,8 +644,9 @@ def test_check_gh_auth_oserror() -> None:
 
 
 def test_check_gh_auth_not_authenticated() -> None:
+    clear_gh_auth_cache()
     with (
-        patch("shutil.which", return_value="/usr/bin/gh"),
+        patch("app.worker._find_gh_on_path", return_value="/usr/bin/gh"),
         patch("subprocess.run") as mock_run,
     ):
         mock_result = MagicMock()
@@ -655,8 +661,9 @@ def test_check_gh_auth_not_authenticated() -> None:
 
 
 def test_check_gh_auth_success() -> None:
+    clear_gh_auth_cache()
     with (
-        patch("shutil.which", return_value="/usr/bin/gh"),
+        patch("app.worker._find_gh_on_path", return_value="/usr/bin/gh"),
         patch("subprocess.run") as mock_run,
     ):
         mock_result = MagicMock()
@@ -696,7 +703,7 @@ def test_delete_run_failure() -> None:
 
         ok, detail = delete_run("owner/repo", "123")
         assert ok is False
-        assert "run not found" in detail
+        assert "may have already been deleted" in detail
 
 
 def test_delete_run_retry_exhausted() -> None:
