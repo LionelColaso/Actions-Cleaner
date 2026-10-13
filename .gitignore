@@ -12,6 +12,8 @@ MANIFEST
 .pytest_cache/
 .coverage
 .coverage.*
+*.cover
+*,cover
 htmlcov/
 coverage.xml
 nosetests.xml
