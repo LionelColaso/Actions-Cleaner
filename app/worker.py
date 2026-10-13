@@ -21,6 +21,7 @@ from .selection import (
     select_runs_to_delete,
 )
 from .settings import (
+    CHECKPOINT_PATH,
     CONCURRENCY_DEFAULT,
     CONCURRENCY_MAX,
     CONCURRENCY_MIN,
@@ -33,6 +34,9 @@ from .settings import (
     TIMEOUT_LIST_DEFAULT,
     TIMEOUT_MAX,
     TIMEOUT_MIN,
+    clear_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
 )
 
 #: Bounds for the user-configurable per-run deletion cap (0 = unlimited).

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any, cast
 
 from .repo import is_valid_repo
@@ -26,6 +27,10 @@ SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".actions-cleaner-repos.js
 #: persisted so the app always starts in safe dry-run mode.
 PREFERENCES_PATH = os.path.join(
     os.path.expanduser("~"), ".actions-cleaner-settings.json"
+)
+#: Progress checkpoint for resume-after-cancel/pause.
+CHECKPOINT_PATH = os.path.join(
+    os.path.expanduser("~"), ".actions-cleaner-checkpoint.json"
 )
 
 #: Bounds for the user-configurable per-run deletion cap (0 = unlimited).
@@ -373,3 +378,103 @@ def import_settings(
             dark_mode,
         ),
     )
+
+
+# =============================================================================
+# Progress checkpoint persistence (for resume after cancel/pause)
+# =============================================================================
+
+
+def save_checkpoint(
+    repo: str,
+    keep: int,
+    dry_run: bool,
+    failed_only: bool,
+    workflow: str,
+    conclusions: set[str],
+    older_than_days: int,
+    delete_ids: list[str],
+    done: int,
+    failed_ids: list[str],
+    max_deletions: int,
+    fetch_limit: int,
+    concurrency: int,
+    list_timeout: int,
+    delete_timeout: int,
+    auth_timeout: int,
+) -> bool:
+    """Save cleanup progress checkpoint for resume capability."""
+    try:
+        with open(CHECKPOINT_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "version": 1,
+                    "repo": repo,
+                    "keep": keep,
+                    "dry_run": dry_run,
+                    "failed_only": failed_only,
+                    "workflow": workflow,
+                    "conclusions": sorted(conclusions),
+                    "older_than_days": older_than_days,
+                    "delete_ids": delete_ids,
+                    "done": done,
+                    "failed_ids": failed_ids,
+                    "max_deletions": max_deletions,
+                    "fetch_limit": fetch_limit,
+                    "concurrency": concurrency,
+                    "list_timeout": list_timeout,
+                    "delete_timeout": delete_timeout,
+                    "auth_timeout": auth_timeout,
+                },
+                f,
+                indent=2,
+            )
+        return True
+    except OSError:
+        return False
+
+
+def load_checkpoint() -> dict[str, Any] | None:
+    """Load cleanup progress checkpoint if valid; return None otherwise."""
+    if not os.path.exists(CHECKPOINT_PATH):
+        return None
+    try:
+        with open(CHECKPOINT_PATH, encoding="utf-8") as f:
+            data: Any = json.load(f)
+    except OSError, json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None
+    # Validate required fields
+    required = [
+        "repo",
+        "keep",
+        "dry_run",
+        "failed_only",
+        "workflow",
+        "conclusions",
+        "older_than_days",
+        "delete_ids",
+        "done",
+        "failed_ids",
+        "max_deletions",
+        "fetch_limit",
+        "concurrency",
+        "list_timeout",
+        "delete_timeout",
+        "auth_timeout",
+    ]
+    for key in required:
+        if key not in data:
+            return None
+    return data
+
+
+def clear_checkpoint() -> bool:
+    """Remove the checkpoint file after successful completion or explicit clear."""
+    try:
+        if os.path.exists(CHECKPOINT_PATH):
+            os.remove(CHECKPOINT_PATH)
+        return True
+    except OSError:
+        return False
