@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 from PySide6.QtWidgets import QApplication
 
-import actions_cleaner_gui as app
+from app.selection import RunInfo
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -29,13 +29,13 @@ def settings_paths(
     """Point the app at per-test settings files."""
     repos = tmp_path / "repos.json"
     prefs = tmp_path / "settings.json"
-    monkeypatch.setattr(app, "SETTINGS_PATH", str(repos))
-    monkeypatch.setattr(app, "PREFERENCES_PATH", str(prefs))
+    monkeypatch.setattr("app.settings.SETTINGS_PATH", str(repos))
+    monkeypatch.setattr("app.settings.PREFERENCES_PATH", str(prefs))
     return repos, prefs
 
 
 @pytest.fixture
-def make_run() -> Callable[..., app.RunInfo]:
+def make_run() -> Callable[..., RunInfo]:
     """Factory for `RunInfo` records used across tests."""
 
     def _make(
@@ -43,8 +43,8 @@ def make_run() -> Callable[..., app.RunInfo]:
         sha: str,
         created: str,
         conclusion: str = "success",
-    ) -> app.RunInfo:
-        return app.RunInfo(
+    ) -> RunInfo:
+        return RunInfo(
             databaseId=run_id,
             headSha=sha,
             createdAt=created,

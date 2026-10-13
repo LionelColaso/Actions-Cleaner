@@ -11,7 +11,23 @@ import pytest
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-import actions_cleaner_gui as app
+from app.icon import (
+    ASSETS_DIR,
+    build_window_icon,
+    find_icon_file,
+    load_app_icon,
+)
+from app.settings import (
+    CONCURRENCY_DEFAULT,
+    FETCH_LIMIT_DEFAULT,
+    FETCH_LIMIT_MAX,
+    FETCH_LIMIT_MIN,
+    TIMEOUT_AUTH_DEFAULT,
+    TIMEOUT_DELETE_DEFAULT,
+    TIMEOUT_LIST_DEFAULT,
+)
+from app.ui import MainWindow
+from app.worker import CleanupWorker
 
 Calls = dict[str, list[tuple[object, ...]]]
 
@@ -41,7 +57,7 @@ def _which_missing(name: str) -> str | None:
     return None
 
 
-class _InstantWorker(app.CleanupWorker):
+class _InstantWorker(CleanupWorker):
     """Worker whose run() does no I/O — safe for lifecycle tests."""
 
     def run(self) -> None:
@@ -50,7 +66,7 @@ class _InstantWorker(app.CleanupWorker):
         self.completion_signal.emit(0, 1, 0, 0)
 
 
-class _RunningWorker(app.CleanupWorker):
+class _RunningWorker(CleanupWorker):
     """Worker that always claims to be running (for closeEvent tests)."""
 
     def isRunning(self) -> bool:
@@ -61,7 +77,7 @@ class _RunningWorker(app.CleanupWorker):
 
 
 def test_window_starts_in_safe_dry_run_mode(dialogs: Calls) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     assert window.dry_run_check.isChecked()
     assert window.keep_spin.value() == 2
     assert not window.cleanup_btn.isEnabled()  # no repo entered yet
@@ -70,7 +86,7 @@ def test_window_starts_in_safe_dry_run_mode(dialogs: Calls) -> None:
 
 
 def test_start_cleanup_rejects_empty_repo(dialogs: Calls) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window.start_cleanup()
     assert len(dialogs["warning"]) == 1
     assert window.worker is None
@@ -78,7 +94,7 @@ def test_start_cleanup_rejects_empty_repo(dialogs: Calls) -> None:
 
 
 def test_start_cleanup_rejects_malformed_repo(dialogs: Calls) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("not-a-repo")
     window.start_cleanup()
     assert len(dialogs["warning"]) == 1
@@ -90,7 +106,7 @@ def test_start_cleanup_requires_gh_on_path(
     monkeypatch: pytest.MonkeyPatch, dialogs: Calls
 ) -> None:
     monkeypatch.setattr(shutil, "which", _which_missing)
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("owner/repo")
     window.start_cleanup()
     assert dialogs["warning"]
@@ -100,7 +116,7 @@ def test_start_cleanup_requires_gh_on_path(
 
 
 def test_cleanup_button_tracks_repo_input(dialogs: Calls) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     assert not window.cleanup_btn.isEnabled()
     window.repo_input.setText("owner/repo")
     assert window.cleanup_btn.isEnabled()
@@ -116,7 +132,7 @@ def test_add_and_remove_repo_roundtrip(
     dialogs: Calls, settings_paths: tuple[Path, Path]
 ) -> None:
     repos_path, _ = settings_paths
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("owner/repo")
     window.add_repo()
     assert window.repo_combo.count() == 1
@@ -130,7 +146,7 @@ def test_add_and_remove_repo_roundtrip(
 
 
 def test_add_repo_rejects_invalid(dialogs: Calls) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("garbage")
     window.add_repo()
     assert dialogs["warning"]
@@ -139,7 +155,7 @@ def test_add_repo_rejects_invalid(dialogs: Calls) -> None:
 
 
 def test_add_repo_rejects_duplicates(dialogs: Calls) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("owner/repo")
     window.add_repo()
     window.add_repo()
@@ -149,7 +165,7 @@ def test_add_repo_rejects_duplicates(dialogs: Calls) -> None:
 
 
 def test_remove_unknown_repo_reports_info(dialogs: Calls) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("unknown/repo")
     window.remove_repo()
     assert dialogs["information"]
@@ -163,7 +179,7 @@ def test_add_repo_accepts_github_url(
     dialogs: Calls, settings_paths: tuple[Path, Path]
 ) -> None:
     repos_path, _ = settings_paths
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("https://github.com/owner/repo/actions")
     window.add_repo()
     assert window.repo_combo.count() == 1
@@ -182,7 +198,7 @@ def test_remove_repo_accepts_github_url(
     dialogs: Calls, settings_paths: tuple[Path, Path]
 ) -> None:
     repos_path, _ = settings_paths
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("owner/repo")
     window.add_repo()
     window.repo_input.setText("https://github.com/owner/repo")
@@ -196,7 +212,7 @@ def test_start_cleanup_accepts_github_url(
     monkeypatch: pytest.MonkeyPatch, dialogs: Calls
 ) -> None:
     monkeypatch.setattr(shutil, "which", _which_missing)
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("https://github.com/owner/repo")
     window.start_cleanup()
     # The URL passed validation; the run stops only at the missing gh CLI.
@@ -212,7 +228,7 @@ def test_repo_combo_reload_preserves_typed_text(
 ) -> None:
     repos_path, _ = settings_paths
     repos_path.write_text(json.dumps(["a/one", "b/two"]), encoding="utf-8")
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("typed/three")
     window.load_repo_list()
     assert window.repo_input.text() == "typed/three"
@@ -221,7 +237,7 @@ def test_repo_combo_reload_preserves_typed_text(
 
 
 def test_on_repo_selected_ignores_empty_text() -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("keep/me")
     window.on_repo_selected("")
     assert window.repo_input.text() == "keep/me"
@@ -236,11 +252,11 @@ def test_on_repo_selected_ignores_empty_text() -> None:
 def test_finished_resets_ui_and_reports_dry_run_success(
     dialogs: Calls,
 ) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("owner/repo")
     window.cleanup_btn.setEnabled(False)
     window.progress_bar.setVisible(True)
-    window.worker = app.CleanupWorker("owner/repo", 2, True)
+    window.worker = CleanupWorker("owner/repo", 2, True)
     window._last_dry_run = True
     window.on_cleanup_finished(0, 5, 3, 0)
 
@@ -255,7 +271,7 @@ def test_finished_resets_ui_and_reports_dry_run_success(
 
 
 def test_finished_failure_reports_critical(dialogs: Calls) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window._last_dry_run = False
     window.on_cleanup_finished(1, 2, 1, 1)
 
@@ -265,7 +281,7 @@ def test_finished_failure_reports_critical(dialogs: Calls) -> None:
 
 
 def test_finished_cancel_reports_information(dialogs: Calls) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window._last_dry_run = False
     window.on_cleanup_finished(2, 4, 2, 0)
 
@@ -277,7 +293,7 @@ def test_finished_cancel_reports_information(dialogs: Calls) -> None:
 def test_finished_suppresses_dialogs_while_closing(
     dialogs: Calls,
 ) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window._close_pending = True
 
     window.on_cleanup_finished(0, 0, 0, 0)
@@ -290,9 +306,9 @@ def test_finished_suppresses_dialogs_while_closing(
 def test_thread_finished_clears_worker_and_reenables(
     dialogs: Calls,
 ) -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("owner/repo")
-    window.worker = app.CleanupWorker("owner/repo", 2, True)
+    window.worker = CleanupWorker("owner/repo", 2, True)
     window.cleanup_btn.setEnabled(False)
 
     window.on_thread_finished()
@@ -303,7 +319,7 @@ def test_thread_finished_clears_worker_and_reenables(
 
 
 def test_close_while_worker_running_defers_and_cancels() -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     worker = _RunningWorker("owner/repo", 2, True)
     window.worker = worker
 
@@ -328,9 +344,9 @@ def test_start_cleanup_full_lifecycle(
 ) -> None:
     _, prefs_path = settings_paths
     monkeypatch.setattr(shutil, "which", _which_ok)
-    monkeypatch.setattr(app, "CleanupWorker", _InstantWorker)
+    monkeypatch.setattr("app.ui.CleanupWorker", _InstantWorker)
 
-    window = app.MainWindow()
+    window = MainWindow()
     window.repo_input.setText("owner/repo")
     window.keep_spin.setValue(7)
     window.start_cleanup()
@@ -351,13 +367,14 @@ def test_start_cleanup_full_lifecycle(
     assert prefs == {
         "keep": 7,
         "failed_only": False,
-        "fetch_limit": app.FETCH_LIMIT_DEFAULT,
+        "fetch_limit": FETCH_LIMIT_DEFAULT,
         "max_deletions": 0,
         "last_repo": "owner/repo",
-        "concurrency": app.CONCURRENCY_DEFAULT,
-        "list_timeout": app.TIMEOUT_LIST_DEFAULT,
-        "delete_timeout": app.TIMEOUT_DELETE_DEFAULT,
-        "auth_timeout": app.TIMEOUT_AUTH_DEFAULT,
+        "concurrency": CONCURRENCY_DEFAULT,
+        "list_timeout": TIMEOUT_LIST_DEFAULT,
+        "delete_timeout": TIMEOUT_DELETE_DEFAULT,
+        "auth_timeout": TIMEOUT_AUTH_DEFAULT,
+        "dark_mode": False,
     }
     window.close()
 
@@ -365,7 +382,7 @@ def test_start_cleanup_full_lifecycle(
 # --- pause/resume + new options --------------------------------------------
 
 
-class _PausableWorker(app.CleanupWorker):
+class _PausableWorker(CleanupWorker):
     """Worker that stays 'running' and records pause-state changes."""
 
     def __init__(self) -> None:
@@ -384,7 +401,7 @@ class _PausableWorker(app.CleanupWorker):
 
 
 def test_pause_button_toggles_and_relabels() -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     worker = _PausableWorker()
     window.worker = worker
 
@@ -400,7 +417,7 @@ def test_pause_button_toggles_and_relabels() -> None:
 
 
 def test_pause_button_ignored_without_running_worker() -> None:
-    window = app.MainWindow()
+    window = MainWindow()
     window.worker = None
     # No worker -> toggle is a no-op and does not raise.
     window.toggle_pause()
@@ -409,29 +426,29 @@ def test_pause_button_ignored_without_running_worker() -> None:
 
 
 def test_new_option_spin_boxes_exist_with_defaults() -> None:
-    window = app.MainWindow()
-    assert window.fetch_limit_spin.value() == app.FETCH_LIMIT_DEFAULT
+    window = MainWindow()
+    assert window.fetch_limit_spin.value() == FETCH_LIMIT_DEFAULT
     assert window.max_deletions_spin.value() == 0
     assert window.max_deletions_spin.specialValueText() == "No limit"
     # Bounds are enforced by the widget.
-    assert window.fetch_limit_spin.minimum() == app.FETCH_LIMIT_MIN
-    assert window.fetch_limit_spin.maximum() == app.FETCH_LIMIT_MAX
+    assert window.fetch_limit_spin.minimum() == FETCH_LIMIT_MIN
+    assert window.fetch_limit_spin.maximum() == FETCH_LIMIT_MAX
     window.close()
 
 
 def test_find_icon_file_returns_packaged_asset() -> None:
     """The designed icon asset is found in the dev checkout."""
-    icon = app.find_icon_file()
+    icon = find_icon_file()
     assert icon is not None
     assert icon.is_file()
     assert icon.name in ("icon.ico", "icon.png")
-    assert icon.parent == app.ASSETS_DIR
+    assert icon.parent == ASSETS_DIR
 
 
 def test_load_app_icon_uses_designed_asset_not_fallback() -> None:
     """load_app_icon returns the designed icon, not the programmatic fallback."""
-    designed = app.load_app_icon()
-    fallback = app.build_window_icon()
+    designed = load_app_icon()
+    fallback = build_window_icon()
     assert not designed.isNull()
     assert not fallback.isNull()
     # The designed icon (from ICO/PNG) has more sizes than the single 64x64
@@ -441,7 +458,7 @@ def test_load_app_icon_uses_designed_asset_not_fallback() -> None:
 
 def test_main_window_sets_designed_icon() -> None:
     """MainWindow.__init__ sets the designed icon on the window."""
-    window = app.MainWindow()
+    window = MainWindow()
     icon = window.windowIcon()
     assert not icon.isNull()
     # The designed asset has multiple sizes; the fallback has one.

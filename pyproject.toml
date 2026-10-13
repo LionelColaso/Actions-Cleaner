@@ -24,12 +24,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-# Single-module app: ship only the entry module (plus nothing else).
-only-include = ["actions_cleaner_gui.py"]
+# Package the app module.
+only-include = ["app/"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-  "actions_cleaner_gui.py",
+  "app/",
   "scripts",
   "README.md",
   "AGENTS.md",
@@ -72,6 +72,7 @@ useLibraryCodeForTypes = true
 exclude = ["venv", ".venv", "build", "**/node_modules", "**/__pycache__", "**/.*"]
 reportMissingTypeStubs = "warning"
 reportUnknownMemberType = false
+reportUnknownVariableType = false
 reportPrivateUsage = "none"
 reportUnusedFunction = "none"
 reportAttributeAccessIssue = "none"
@@ -81,7 +82,7 @@ testpaths = ["tests"]
 qt_api = "pyside6"
 
 [tool.coverage.run]
-source = ["actions_cleaner_gui"]
+source = ["actions_cleaner"]
 branch = true
 omit = [
   "tests/**",

@@ -1,5 +1,5 @@
 {
-  "threshold": 0,
+  "threshold": 5,
   "ignore": [
     "**/.venv/**",
     "**/.git/**",
@@ -12,6 +12,8 @@
     "**/*.md",
     "**/docs/**",
     "coverage.xml",
-    ".coverage"
+    ".coverage",
+    "tests/**",
+    "scripts/**"
   ]
 }

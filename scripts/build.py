@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = ROOT / "build"
-ENTRYPOINT = ROOT / "actions_cleaner_gui.py"
+ENTRYPOINT = ROOT / "app"
 
 
 def _build_nuitka_command(product_version: str = "", dev: bool = False) -> list[str]:
@@ -40,6 +40,8 @@ def _build_nuitka_command(product_version: str = "", dev: bool = False) -> list[
         "--nofollow-import-to=nodeenv",
         f"--output-dir={OUT_DIR}",
         "--remove-output",
+        "--python-flag=-m",
+        "app",
     ]
 
     system = platform.system()
@@ -54,7 +56,6 @@ def _build_nuitka_command(product_version: str = "", dev: bool = False) -> list[
     elif system == "Darwin":
         args.append("--macos-create-app-bundle")
 
-    args.append(str(ENTRYPOINT))
     return args
 
 
@@ -81,16 +82,37 @@ def _build_gui(product_version: str, dev: bool) -> int:
 
 def _find_built_exe() -> Path | None:
     if platform.system() == "Windows":
-        exe = OUT_DIR / "actions_cleaner_gui.dist" / "actions-cleaner.exe"
+        # When using --python-flag=-m app, Nuitka creates app.dist
+        exe = OUT_DIR / "app.dist" / "actions-cleaner.exe"
+        if exe.is_file():
+            return exe
+        # Fallback for __main__.dist (when entrypoint is __main__.py)
+        exe = OUT_DIR / "__main__.dist" / "actions-cleaner.exe"
+        if exe.is_file():
+            return exe
+        # Fallback for app___main__.dist
+        exe = OUT_DIR / "app___main__.dist" / "actions-cleaner.exe"
         return exe if exe.is_file() else None
     if platform.system() == "Darwin":
         bundle = OUT_DIR / "actions-cleaner.app"
         if bundle.is_dir():
             macos_exe = bundle / "Contents" / "MacOS" / "actions-cleaner"
             return macos_exe if macos_exe.is_file() else None
-        standalone = OUT_DIR / "actions_cleaner_gui.dist" / "actions-cleaner"
+        standalone = OUT_DIR / "app.dist" / "actions-cleaner"
+        if standalone.is_file():
+            return standalone
+        standalone = OUT_DIR / "__main__.dist" / "actions-cleaner"
+        if standalone.is_file():
+            return standalone
+        standalone = OUT_DIR / "app___main__.dist" / "actions-cleaner"
         return standalone if standalone.is_file() else None
-    standalone = OUT_DIR / "actions_cleaner_gui.dist" / "actions-cleaner"
+    standalone = OUT_DIR / "app.dist" / "actions-cleaner"
+    if standalone.is_file():
+        return standalone
+    standalone = OUT_DIR / "__main__.dist" / "actions-cleaner"
+    if standalone.is_file():
+        return standalone
+    standalone = OUT_DIR / "app___main__.dist" / "actions-cleaner"
     return standalone if standalone.is_file() else None
 
 

@@ -6,7 +6,7 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 # ─── Global Variables ────────────────────────────────────────────────────
 config_and_path := "--config pyproject.toml ."
 pytest_opts := "--no-qt-log -s -ra"
-cov_opts := "--cov=actions_cleaner_gui --cov-report=xml --cov-report=html --cov-report=term-missing --junitxml=junit/test-results.xml"
+cov_opts := "--cov=app --cov-report=xml --cov-report=html --cov-report=term-missing --junitxml=junit/test-results.xml"
 
 # ─── Default Target ──────────────────────────────────────────────────────
 @default:
@@ -18,7 +18,7 @@ cov_opts := "--cov=actions_cleaner_gui --cov-report=xml --cov-report=html --cov-
 
 # Run the actions-cleaner application
 run: dev-setup
-    uv run python actions_cleaner_gui.py
+    uv run python -m app
 
 # Run all tests (skips gracefully if tests/ does not exist or is empty)
 [unix]

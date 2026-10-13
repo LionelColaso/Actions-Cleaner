@@ -8,9 +8,16 @@ from collections.abc import Callable
 
 import pytest
 
-import actions_cleaner_gui as app
+from app.selection import RunInfo
+from app.settings import (
+    CONCURRENCY_MAX,
+    CONCURRENCY_MIN,
+    TIMEOUT_DELETE_DEFAULT,
+    TIMEOUT_LIST_DEFAULT,
+)
+from app.worker import CleanupWorker
 
-MakeRun = Callable[..., app.RunInfo]
+MakeRun = Callable[..., RunInfo]
 
 
 class WorkerResult:
@@ -37,18 +44,20 @@ class _GhMock:
     """Configurable stand-in for the module's gh helper functions."""
 
     def __init__(self) -> None:
-        self.runs: list[app.RunInfo] = []
+        self.runs: list[RunInfo] = []
         self.auth_error = ""
         self.list_error: BaseException | None = None
         self.delete_error: BaseException | None = None
         self.delete_ok = True
         self.delete_detail = ""
         self.delete_calls: list[str] = []
+        self.batch_delete_calls: list[list[str]] = []
         self.list_fetch_limit = 0
         self.list_workflow = ""
         self.list_timeout_seen = 0
         self.delete_timeout_seen = 0
         self.auth_timeout_seen = 0
+        self.batch_delete_results: list[tuple[str, bool, str]] | None = None
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_auth(timeout: int = 30) -> str:
@@ -59,8 +68,8 @@ class _GhMock:
             repo: str,
             fetch_limit: int = 0,
             workflow: str = "",
-            timeout: int = app.TIMEOUT_LIST_DEFAULT,
-        ) -> list[app.RunInfo]:
+            timeout: int = TIMEOUT_LIST_DEFAULT,
+        ) -> list[RunInfo]:
             self.list_timeout_seen = timeout
             if self.list_error is not None:
                 raise self.list_error
@@ -69,7 +78,7 @@ class _GhMock:
             return list(self.runs)
 
         def fake_delete(
-            repo: str, run_id: str, timeout: int = app.TIMEOUT_DELETE_DEFAULT
+            repo: str, run_id: str, timeout: int = TIMEOUT_DELETE_DEFAULT
         ) -> tuple[bool, str]:
             self.delete_timeout_seen = timeout
             if self.delete_error is not None:
@@ -77,12 +86,25 @@ class _GhMock:
             self.delete_calls.append(run_id)
             return self.delete_ok, self.delete_detail
 
-        monkeypatch.setattr(app, "check_gh_auth", fake_auth)
-        monkeypatch.setattr(app, "list_runs", fake_list)
-        monkeypatch.setattr(app, "delete_run", fake_delete)
+        def fake_batch_delete(
+            repo: str, run_ids: list[str], timeout: int = TIMEOUT_DELETE_DEFAULT
+        ) -> list[tuple[str, bool, str]]:
+            self.delete_timeout_seen = timeout
+            self.batch_delete_calls.append(list(run_ids))
+            self.delete_calls.extend(run_ids)
+            if self.batch_delete_results is not None:
+                return self.batch_delete_results
+            if self.delete_error is not None:
+                raise self.delete_error
+            return [(run_id, self.delete_ok, self.delete_detail) for run_id in run_ids]
+
+        monkeypatch.setattr("app.worker.check_gh_auth", fake_auth)
+        monkeypatch.setattr("app.worker.list_runs", fake_list)
+        monkeypatch.setattr("app.worker.delete_run", fake_delete)
+        monkeypatch.setattr("app.worker.delete_runs_batch", fake_batch_delete)
 
 
-def _run_worker(worker: app.CleanupWorker) -> WorkerResult:
+def _run_worker(worker: CleanupWorker) -> WorkerResult:
     result = WorkerResult()
     worker.log_signal.connect(result.logs.append)
     worker.finished_signal.connect(result.finished.append)
@@ -95,7 +117,7 @@ def _run_worker(worker: app.CleanupWorker) -> WorkerResult:
 
 
 def _run_with_release(
-    worker: app.CleanupWorker, release: Callable[[], object]
+    worker: CleanupWorker, release: Callable[[], object]
 ) -> WorkerResult:
     """Run the worker, firing `release` on a timer so a paused run() wakes."""
     timer = threading.Timer(0.2, release)
@@ -106,7 +128,7 @@ def _run_with_release(
         timer.join()
 
 
-def _sample_runs(make_run: MakeRun) -> list[app.RunInfo]:
+def _sample_runs(make_run: MakeRun) -> list[RunInfo]:
     return [
         make_run(1, "new", "2024-06-01T00:00:00Z"),
         make_run(2, "new", "2024-06-01T01:00:00Z"),
@@ -114,7 +136,7 @@ def _sample_runs(make_run: MakeRun) -> list[app.RunInfo]:
     ]
 
 
-def _four_run_sample(make_run: MakeRun) -> list[app.RunInfo]:
+def _four_run_sample(make_run: MakeRun) -> list[RunInfo]:
     """Three old commits + one new — used by max-deletions and concurrency tests."""
     return [
         make_run(1, "old-a", "2024-05-01T00:00:00Z"),
@@ -127,14 +149,35 @@ def _four_run_sample(make_run: MakeRun) -> list[app.RunInfo]:
 def _install_worker(
     monkeypatch: pytest.MonkeyPatch,
     make_run: MakeRun,
-    runs: list[app.RunInfo],
-    **kwargs: object,
-) -> tuple[_GhMock, app.CleanupWorker, WorkerResult]:
+    runs: list[RunInfo],
+    keep: int = 1,
+    dry_run: bool = True,
+    fetch_limit: int = 1000,
+    max_deletions: int = 0,
+    workflow: str = "",
+    concurrency: int = 1,
+    list_timeout: int = 60,
+    delete_timeout: int = 30,
+    auth_timeout: int = 15,
+    older_than_days: int = 0,
+) -> tuple[_GhMock, CleanupWorker, WorkerResult]:
     """Install a fresh mock with `runs`, build a worker, run it, return all three."""
     gh = _GhMock()
     gh.runs = runs
     gh.install(monkeypatch)
-    worker = app.CleanupWorker("owner/repo", **kwargs)  # type: ignore[arg-type]
+    worker = CleanupWorker(
+        "owner/repo",
+        keep=keep,
+        dry_run=dry_run,
+        fetch_limit=fetch_limit,
+        max_deletions=max_deletions,
+        workflow=workflow,
+        concurrency=concurrency,
+        list_timeout=list_timeout,
+        delete_timeout=delete_timeout,
+        auth_timeout=auth_timeout,
+        older_than_days=older_than_days,
+    )
     result = _run_worker(worker)
     return gh, worker, result
 
@@ -146,7 +189,7 @@ def test_dry_run_never_deletes(
     gh.runs = _sample_runs(make_run)
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
     assert gh.delete_calls == []
@@ -164,7 +207,7 @@ def test_real_run_deletes_and_reports_success(
     gh.runs = _sample_runs(make_run)
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=False)
     result = _run_worker(worker)
 
     assert gh.delete_calls == ["3"]
@@ -182,7 +225,7 @@ def test_failed_deletions_produce_failure_code(
     gh.delete_detail = "boom"
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=False)
     result = _run_worker(worker)
 
     assert result.completions == [(1, 2, 0, 1)]  # never report success with failures
@@ -197,7 +240,7 @@ def test_missing_gh_cli_is_caught(
     gh.list_error = FileNotFoundError("gh")
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
     assert result.completions == [(1, 0, 0, 0)]
@@ -211,7 +254,7 @@ def test_called_process_error_is_caught(
     gh.list_error = subprocess.CalledProcessError(128, ["gh"], stderr="boom")
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
     assert result.completions == [(1, 0, 0, 0)]
@@ -225,7 +268,7 @@ def test_unexpected_output_is_caught(
     gh.list_error = TypeError("unexpected gh output")
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
     assert result.completions == [(1, 0, 0, 0)]
@@ -239,7 +282,7 @@ def test_auth_failure_short_circuits(
     gh.list_error = AssertionError("list_runs must not be called")
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
     assert result.completions == [(1, 0, 0, 0)]
@@ -252,7 +295,7 @@ def test_no_runs_is_not_an_error(
     gh = _GhMock()
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True)
     result = _run_worker(worker)
 
     assert result.completions == [(0, 0, 0, 0)]
@@ -271,7 +314,7 @@ def test_failed_only_considers_only_failed_runs(
     gh.delete_error = AssertionError("no run should be deleted")
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, failed_only=True)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=False, failed_only=True)
     result = _run_worker(worker)
 
     # Only the failed run remains, and it belongs to the single kept commit.
@@ -288,7 +331,7 @@ def test_cancel_stops_before_deleting(
     gh.delete_error = AssertionError("cancelled worker must not delete")
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=False)
     worker.cancel()
     result = _run_worker(worker)
 
@@ -303,7 +346,7 @@ def test_fetch_limit_is_passed_to_list_runs(
     gh.runs = _sample_runs(make_run)
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True, fetch_limit=250)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True, fetch_limit=250)
     _run_worker(worker)
 
     assert gh.list_fetch_limit == 250
@@ -366,16 +409,15 @@ def test_concurrency_parallel_deletes_all(
 ) -> None:
     """A pool of workers still deletes every targeted run; failed IDs are
     reported by name in the log instead of just a count."""
-    gh, _worker, result = _install_worker(
-        monkeypatch,
-        make_run,
-        _four_run_sample(make_run),
-        keep=1,
-        dry_run=False,
-        concurrency=4,
-    )
+    gh = _GhMock()
+    gh.runs = _four_run_sample(make_run)
+    gh.install(monkeypatch)
 
-    assert set(gh.delete_calls) == {"1", "2", "3"}
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=False, concurrency=4)
+    result = _run_worker(worker)
+
+    # With batch delete, all runs are deleted in one batch call
+    assert set(gh.batch_delete_calls[0]) == {"1", "2", "3"}
     assert result.completions == [(0, 1, 3, 0)]
 
 
@@ -391,20 +433,23 @@ def test_concurrency_reports_failed_ids_by_name(
     ]
     gh.install(monkeypatch)
 
-    # Make run "1" fail so the log should name it explicitly.
-    # Override the mock's delete after install so the worker uses flaky_delete.
-    original_delete = app.delete_run
+    # Override delete_runs_batch to make run "1" fail
+    original_batch_delete = "app.worker.delete_runs_batch"
 
-    def flaky_delete(
-        repo: str, run_id: str, timeout: int = app.TIMEOUT_DELETE_DEFAULT
-    ) -> tuple[bool, str]:
-        if run_id == "1":
-            return False, "boom"
-        return original_delete(repo, run_id, timeout)
+    def flaky_batch_delete(
+        repo: str, run_ids: list[str], timeout: int = TIMEOUT_DELETE_DEFAULT
+    ) -> list[tuple[str, bool, str]]:
+        results = []
+        for run_id in run_ids:
+            if run_id == "1":
+                results.append((run_id, False, "boom"))
+            else:
+                results.append((run_id, True, ""))
+        return results
 
-    monkeypatch.setattr(app, "delete_run", flaky_delete)
+    monkeypatch.setattr(original_batch_delete, flaky_batch_delete)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False, concurrency=3)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=False, concurrency=3)
     result = _run_worker(worker)
 
     assert result.completions == [(1, 1, 1, 1)]
@@ -416,11 +461,11 @@ def test_concurrency_reports_failed_ids_by_name(
 
 
 def test_concurrency_clamped_to_bounds() -> None:
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True, concurrency=0)
-    assert worker.concurrency == app.CONCURRENCY_MIN
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True, concurrency=0)
+    assert worker.concurrency == CONCURRENCY_MIN
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=True, concurrency=99)
-    assert worker.concurrency == app.CONCURRENCY_MAX
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=True, concurrency=99)
+    assert worker.concurrency == CONCURRENCY_MAX
 
 
 def test_pause_blocks_until_resumed(
@@ -433,7 +478,7 @@ def test_pause_blocks_until_resumed(
     ]
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=False)
     worker.set_paused(True)
     assert worker.paused is True
 
@@ -455,7 +500,7 @@ def test_cancel_releases_a_paused_worker(
     gh.delete_error = AssertionError("paused-then-cancelled run must not delete")
     gh.install(monkeypatch)
 
-    worker = app.CleanupWorker("owner/repo", keep=1, dry_run=False)
+    worker = CleanupWorker("owner/repo", keep=1, dry_run=False)
     worker.set_paused(True)
 
     # A pause + cancel must not deadlock; run() exits as cancelled.
