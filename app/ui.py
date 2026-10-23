@@ -9,7 +9,7 @@ import sys
 import time
 from collections.abc import Callable
 
-from PySide6.QtCore import QThreadPool, Qt
+from PySide6.QtCore import Qt, QThreadPool
 from PySide6.QtGui import QAction, QCloseEvent, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -549,6 +549,7 @@ class MainWindow(QWidget):
             delete_timeout,
             auth_timeout,
             dark_mode,
+            auto_update,
         ) = prefs
         # Merge repos (avoid duplicates)
         for repo in repos:
@@ -568,6 +569,7 @@ class MainWindow(QWidget):
             delete_timeout,
             auth_timeout,
             self.dark_mode_check.isChecked(),
+            self.auto_update_check.isChecked(),
         ):
             QMessageBox.critical(self, "Error", "Failed to save imported preferences.")
             return
@@ -583,6 +585,7 @@ class MainWindow(QWidget):
             delete_timeout,
             auth_timeout,
             dark_mode,
+            auto_update,
         )
         QMessageBox.information(
             self,

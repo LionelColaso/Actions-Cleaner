@@ -375,6 +375,7 @@ def test_start_cleanup_full_lifecycle(
         "delete_timeout": TIMEOUT_DELETE_DEFAULT,
         "auth_timeout": TIMEOUT_AUTH_DEFAULT,
         "dark_mode": False,
+        "auto_update": False,
     }
     window.close()
 

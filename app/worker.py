@@ -202,7 +202,7 @@ def get_latest_release(timeout: int = GH_RELEASE_TIMEOUT) -> str | None:
             check=False,
             timeout=timeout,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired, OSError:
         return None
     if result.returncode != 0:
         return None

@@ -296,22 +296,25 @@ def export_settings(path: str) -> bool:
 
 def import_settings(
     path: str,
-) -> tuple[
-    list[str],
+) -> (
     tuple[
-        int,
-        bool,
-        int,
-        int,
-        str,
-        int,
-        int,
-        int,
-        int,
-        bool,
-        bool,
-    ],
-] | None:
+        list[str],
+        tuple[
+            int,
+            bool,
+            int,
+            int,
+            str,
+            int,
+            int,
+            int,
+            int,
+            bool,
+            bool,
+        ],
+    ]
+    | None
+):
     """Import repositories and preferences from a JSON file.
 
     Returns tuple of (repos, preferences) or None on failure.

@@ -321,6 +321,7 @@ class TestSettingsPersistenceProperties:
                     60,
                     30,
                     True,
+                    False,
                 )
                 assert loaded == expected_tuple
 

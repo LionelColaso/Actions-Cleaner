@@ -169,6 +169,7 @@ def test_load_preferences_defaults(
         TIMEOUT_DELETE_DEFAULT,
         TIMEOUT_AUTH_DEFAULT,
         False,
+        False,
     )
 
 
@@ -184,6 +185,7 @@ def test_preferences_roundtrip(settings_paths: tuple[Path, Path]) -> None:
         TIMEOUT_LIST_DEFAULT,
         TIMEOUT_DELETE_DEFAULT,
         TIMEOUT_AUTH_DEFAULT,
+        False,
         False,
     )
 
@@ -203,6 +205,7 @@ def test_preferences_roundtrip_with_last_repo(
         TIMEOUT_DELETE_DEFAULT,
         TIMEOUT_AUTH_DEFAULT,
         False,
+        False,
     )
 
 
@@ -221,6 +224,7 @@ def test_preferences_roundtrip_with_concurrency(
         TIMEOUT_DELETE_DEFAULT,
         TIMEOUT_AUTH_DEFAULT,
         False,
+        False,
     )
 
 
@@ -228,7 +232,19 @@ def test_preferences_roundtrip_with_timeouts(
     settings_paths: tuple[Path, Path],
 ) -> None:
     assert save_preferences(7, True, 500, 25, "owner/repo", 8, 120, 90, 45)
-    assert load_preferences() == (7, True, 500, 25, "owner/repo", 8, 120, 90, 45, False)
+    assert load_preferences() == (
+        7,
+        True,
+        500,
+        25,
+        "owner/repo",
+        8,
+        120,
+        90,
+        45,
+        False,
+        False,
+    )
 
 
 def test_preferences_roundtrip_uses_defaults_for_new_fields(
@@ -246,6 +262,7 @@ def test_preferences_roundtrip_uses_defaults_for_new_fields(
         TIMEOUT_LIST_DEFAULT,
         TIMEOUT_DELETE_DEFAULT,
         TIMEOUT_AUTH_DEFAULT,
+        False,
         False,
     )
 
@@ -266,6 +283,7 @@ def test_load_preferences_corrupt_json(
         TIMEOUT_DELETE_DEFAULT,
         TIMEOUT_AUTH_DEFAULT,
         False,
+        False,
     )
 
 
@@ -283,6 +301,7 @@ def test_load_preferences_rejects_bad_values(
         TIMEOUT_LIST_DEFAULT,
         TIMEOUT_DELETE_DEFAULT,
         TIMEOUT_AUTH_DEFAULT,
+        False,
         False,
     )
     _write(
@@ -375,6 +394,7 @@ def test_load_preferences_accepts_valid_new_fields(
         TIMEOUT_LIST_DEFAULT,
         TIMEOUT_DELETE_DEFAULT,
         TIMEOUT_AUTH_DEFAULT,
+        False,
         False,
     )
     # 0 deletions and the minimum fetch limit are both accepted.
@@ -487,6 +507,7 @@ def test_import_settings_valid_file(
         delete_timeout,
         auth_timeout,
         dark_mode,
+        auto_update,
     ) = prefs
     assert keep == 3
     assert failed_only is True
@@ -609,6 +630,7 @@ def test_import_settings_uses_defaults_for_missing_prefs(
         delete_timeout,
         auth_timeout,
         dark_mode,
+        auto_update,
     ) = prefs
     assert keep == 2
     assert failed_only is False
@@ -620,6 +642,7 @@ def test_import_settings_uses_defaults_for_missing_prefs(
     assert delete_timeout == TIMEOUT_DELETE_DEFAULT
     assert auth_timeout == TIMEOUT_AUTH_DEFAULT
     assert dark_mode is False
+    assert auto_update is False
 
 
 def test_import_settings_rejects_invalid_pref_values(
@@ -661,6 +684,7 @@ def test_import_settings_rejects_invalid_pref_values(
         delete_timeout,
         auth_timeout,
         dark_mode,
+        auto_update,
     ) = prefs
     # All should fall back to defaults
     assert keep == 2
