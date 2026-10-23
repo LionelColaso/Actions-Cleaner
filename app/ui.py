@@ -9,8 +9,8 @@ import sys
 import time
 from collections.abc import Callable
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QCloseEvent, QKeyEvent
+from PySide6.QtCore import QThreadPool, Qt
+from PySide6.QtGui import QAction, QCloseEvent, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,11 +22,13 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
-    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QSystemTrayIcon,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -55,10 +57,43 @@ from .settings import (
     save_preferences,
     save_repos,
 )
-from .worker import CleanupWorker
+from .worker import (
+    RELEASE_REPO,
+    CleanupWorker,
+    UpdateCheckSignals,
+    UpdateCheckTask,
+)
 
 VERSION = "0.1.0"
 LOG_MAX_BLOCKS = 5000
+
+# HTML colors for log levels
+LOG_COLOR_ERROR = "#ff6b6b"  # Red for errors
+LOG_COLOR_SUCCESS = "#51cf66"  # Green for success
+LOG_COLOR_WARNING = "#ffd43b"  # Yellow for warnings
+LOG_COLOR_INFO = "#74c0fc"  # Blue for info
+LOG_COLOR_DRY_RUN = "#fab005"  # Orange for dry-run
+LOG_COLOR_NORMAL = "#e0e0e0"  # Light gray for normal text
+
+
+def _log_html(message: str) -> str:
+    """Convert a log message to HTML with appropriate color coding."""
+    # Escape HTML
+    escaped = message.replace("&", "&").replace("<", "<").replace(">", ">")
+    # Color based on prefix/content
+    if escaped.startswith("Error:") or "Error" in escaped.split(":")[0]:
+        color = LOG_COLOR_ERROR
+    elif escaped.startswith("Warning:") or "Warning" in escaped.split(":")[0]:
+        color = LOG_COLOR_WARNING
+    elif "Deleted run" in escaped or "Cleanup complete" in escaped:
+        color = LOG_COLOR_SUCCESS
+    elif "DRY-RUN" in escaped or "would delete" in escaped:
+        color = LOG_COLOR_DRY_RUN
+    elif "Fetching" in escaped or "Checking" in escaped or "Cleaning" in escaped:
+        color = LOG_COLOR_INFO
+    else:
+        color = LOG_COLOR_NORMAL
+    return f'<span style="color: {color};">{escaped}</span>'
 
 
 class MainWindow(QWidget):
@@ -85,6 +120,7 @@ class MainWindow(QWidget):
             delete_timeout,
             auth_timeout,
             dark_mode,
+            auto_update,
         ) = load_preferences()
         self._apply_preferences(
             keep,
@@ -97,8 +133,12 @@ class MainWindow(QWidget):
             delete_timeout,
             auth_timeout,
             dark_mode,
+            auto_update,
         )
         self._refresh_cleanup_enabled()
+        self._setup_system_tray()
+        if auto_update:
+            self._start_update_check()
 
     def _apply_preferences(
         self,
@@ -112,6 +152,7 @@ class MainWindow(QWidget):
         delete_timeout: int,
         auth_timeout: int,
         dark_mode: bool,
+        auto_update: bool,
     ) -> None:
         """Apply loaded preferences to UI controls."""
         self.keep_spin.setValue(keep)
@@ -125,8 +166,68 @@ class MainWindow(QWidget):
         self.dark_mode_check.setChecked(dark_mode)
         if dark_mode:
             self.toggle_dark_mode(True)
+        self.auto_update_check.setChecked(auto_update)
         if last_repo:
             self.repo_input.setText(last_repo)
+
+    def _setup_system_tray(self) -> None:
+        """Set up the system tray icon and menu."""
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(load_app_icon())
+        self.tray_icon.setToolTip("GitHub Actions Cleaner")
+
+        tray_menu = QMenu()
+
+        show_action = QAction("Show Window", self)
+        show_action.triggered.connect(self.showNormal)
+        tray_menu.addAction(show_action)
+
+        hide_action = QAction("Hide Window", self)
+        hide_action.triggered.connect(self.hide)
+        tray_menu.addAction(hide_action)
+
+        tray_menu.addSeparator()
+
+        self.tray_cleanup_action = QAction("Clean Up Actions", self)
+        self.tray_cleanup_action.triggered.connect(self.start_cleanup)
+        self.tray_cleanup_action.setEnabled(False)
+        tray_menu.addAction(self.tray_cleanup_action)
+
+        self.tray_cleanup_all_action = QAction("Clean All Saved Repos", self)
+        self.tray_cleanup_all_action.triggered.connect(self.start_cleanup_all)
+        self.tray_cleanup_all_action.setEnabled(False)
+        tray_menu.addAction(self.tray_cleanup_all_action)
+
+        tray_menu.addSeparator()
+
+        quit_action = QAction("Quit", self)
+        app = QApplication.instance()
+        if app is not None:
+            quit_action.triggered.connect(app.quit)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+
+        # Show tray icon if system tray is available
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon.show()
+        else:
+            # Don't set to None, just hide it
+            self.tray_icon.hide()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        """Handle tray icon activation (click/double-click)."""
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            if self.isVisible():
+                self.hide()
+            else:
+                self.showNormal()
+                self.raise_()
+                self.activateWindow()
 
     def setup_ui(self) -> None:
         form = QGroupBox("Settings")
@@ -233,6 +334,13 @@ class MainWindow(QWidget):
         self.dark_mode_check.toggled.connect(self.toggle_dark_mode)
         form_layout.addRow("", self.dark_mode_check)
 
+        self.auto_update_check = QCheckBox("Check for updates on startup")
+        self.auto_update_check.setToolTip(
+            "Check GitHub Releases for a newer version on startup "
+            "and notify when one is available"
+        )
+        form_layout.addRow("", self.auto_update_check)
+
         self.workflow_input = QLineEdit()
         self.workflow_input.setPlaceholderText(
             "workflow name or ID (optional, leave blank for all)"
@@ -313,9 +421,20 @@ class MainWindow(QWidget):
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
 
-        self.log_output = QPlainTextEdit()
+        self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
-        self.log_output.setMaximumBlockCount(LOG_MAX_BLOCKS)
+        # QTextEdit doesn't have setMaximumBlockCount; use document().setMaximumBlockCount()
+        self.log_output.document().setMaximumBlockCount(LOG_MAX_BLOCKS)
+        self.log_output.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.log_output.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+                font-family: "Consolas", "Monospace";
+                font-size: 11pt;
+                border: 1px solid #555555;
+            }
+        """)
 
         self.summary_label = QLabel()
         self.summary_label.setVisible(False)
@@ -343,6 +462,36 @@ class MainWindow(QWidget):
         has_saved_repos = bool(self._repos)
         self.cleanup_btn.setEnabled(not busy and has_repo)
         self.cleanup_all_btn.setEnabled(not busy and has_saved_repos)
+        # Update tray actions
+        if getattr(self, "tray_icon", None) is not None:
+            self.tray_cleanup_action.setEnabled(not busy and has_repo)
+            self.tray_cleanup_all_action.setEnabled(not busy and has_saved_repos)
+
+    def _start_update_check(self) -> None:
+        """Check GitHub Releases for a newer version when auto-update is on."""
+        if self.worker is not None:
+            return
+        signals = UpdateCheckSignals()
+        task = UpdateCheckTask(signals=signals)
+        task.setAutoDelete(True)
+        QThreadPool.globalInstance().start(task)
+        signals.result_signal.connect(self._on_update_check_result)
+
+    def _on_update_check_result(self, available: bool, message: str) -> None:
+        """React to the async GitHub release check result (GUI thread)."""
+        if available:
+            release_url = f"https://github.com/{RELEASE_REPO}/releases/latest"
+            self.log_output.append(_log_html(f"Update available: {message}"))
+            QMessageBox.information(
+                self,
+                "Update available",
+                f"A new version of GitHub Actions Cleaner is available.\n\n"
+                f"{message}\n\n"
+                f"You're running version {VERSION}.\n"
+                f"Release: {release_url}",
+            )
+        else:
+            self.log_output.append(_log_html(f"Update check: {message}"))
 
     def load_repo_list(self) -> None:
         """Repopulate the combo without firing selection signals."""
@@ -555,8 +704,11 @@ class MainWindow(QWidget):
             self.delete_timeout_spin.value(),
             self.auth_timeout_spin.value(),
             self.dark_mode_check.isChecked(),
+            self.auto_update_check.isChecked(),
         ):
-            self.log_output.appendPlainText("Warning: could not write preferences file")
+            self.log_output.append(
+                _log_html("Warning: could not write preferences file")
+            )
 
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -612,7 +764,11 @@ class MainWindow(QWidget):
     ) -> None:
         """Connect worker signals to the given handlers."""
         assert self.worker is not None
-        self.worker.log_signal.connect(self.log_output.appendPlainText)
+
+        def _append_log(msg: str) -> None:
+            self.log_output.append(_log_html(msg))
+
+        self.worker.log_signal.connect(_append_log)
         self.worker.max_signal.connect(self.progress_bar.setMaximum)
         self.worker.progress_signal.connect(self.progress_bar.setValue)
         self.worker.summary_signal.connect(on_summary)
@@ -656,9 +812,11 @@ class MainWindow(QWidget):
             return
 
         repo = self._cleanup_all_repos[self._cleanup_all_index]
-        self.log_output.appendPlainText(
-            f"\n=== [{self._cleanup_all_index + 1}/{len(self._cleanup_all_repos)}] "
-            f"Cleaning {repo} ==="
+        self.log_output.append(
+            _log_html(
+                f"\n=== [{self._cleanup_all_index + 1}/{len(self._cleanup_all_repos)}] "
+                f"Cleaning {repo} ==="
+            )
         )
         self.repo_input.setText(repo)
 
@@ -752,8 +910,8 @@ class MainWindow(QWidget):
             self.cancel_btn.setEnabled(False)
             self.pause_btn.setEnabled(False)
             self._cancelled = True
-            self.log_output.appendPlainText(
-                "Cancelling — waiting for the current operation to finish..."
+            self.log_output.append(
+                _log_html("Cancelling — waiting for the current operation to finish...")
             )
 
     def toggle_pause(self) -> None:
@@ -762,8 +920,10 @@ class MainWindow(QWidget):
         pausing = not self.worker.paused
         self.worker.set_paused(pausing)
         self.pause_btn.setText("Resume" if pausing else "Pause")
-        self.log_output.appendPlainText(
-            "Paused — click Resume to continue." if pausing else "Resuming..."
+        self.log_output.append(
+            _log_html(
+                "Paused — click Resume to continue." if pausing else "Resuming..."
+            )
         )
 
     def reset_defaults(self) -> None:
@@ -810,7 +970,7 @@ class MainWindow(QWidget):
                 left: 10px;
                 padding: 0 5px;
             }
-            QLineEdit, QPlainTextEdit, QSpinBox, QComboBox {
+            QLineEdit, QTextEdit, QSpinBox, QComboBox {
                 background-color: #3c3c3c;
                 border: 1px solid #555555;
                 color: #ffffff;
@@ -919,12 +1079,24 @@ class MainWindow(QWidget):
             # Never destroy a running QThread; cancel and close once it ends.
             self._close_pending = True
             self.worker.cancel()
-            self.log_output.appendPlainText(
-                "Closing — waiting for the running cleanup to stop..."
+            self.log_output.append(
+                _log_html("Closing — waiting for the running cleanup to stop...")
             )
             event.ignore()
             return
-        event.accept()
+        # If system tray is available, hide to tray instead of closing
+        tray_icon = getattr(self, "tray_icon", None)
+        if tray_icon is not None and QSystemTrayIcon.isSystemTrayAvailable():
+            self.hide()
+            tray_icon.showMessage(
+                "GitHub Actions Cleaner",
+                "Application minimized to tray. Click tray icon to restore.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000,
+            )
+            event.ignore()
+        else:
+            event.accept()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         """Handle keyboard shortcuts."""
@@ -970,6 +1142,69 @@ def make_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"actions-cleaner {VERSION}",
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run in headless mode (no GUI) - requires --repo and other options",
+    )
+    parser.add_argument(
+        "--repo",
+        type=str,
+        help="Repository to clean (owner/repo)",
+    )
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=2,
+        help="Number of commits to keep (default: 2)",
+    )
+    parser.add_argument(
+        "--fetch-limit",
+        type=int,
+        default=1000,
+        help="Number of runs to fetch (default: 1000)",
+    )
+    parser.add_argument(
+        "--max-deletions",
+        type=int,
+        default=0,
+        help="Maximum runs to delete per run (0 = unlimited, default: 0)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=True,
+        help="Don't actually delete runs (default: True)",
+    )
+    parser.add_argument(
+        "--no-dry-run",
+        action="store_false",
+        dest="dry_run",
+        help="Actually delete runs (opposite of --dry-run)",
+    )
+    parser.add_argument(
+        "--failed-only",
+        action="store_true",
+        help="Only consider failed/cancelled/timed-out runs",
+    )
+    parser.add_argument(
+        "--older-than-days",
+        type=int,
+        default=0,
+        help="Only consider runs older than N days (0 = disabled, default: 0)",
+    )
+    parser.add_argument(
+        "--workflow",
+        type=str,
+        default="",
+        help="Filter by workflow name or ID",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Deletion concurrency (default: 1)",
+    )
     return parser
 
 
@@ -985,8 +1220,83 @@ def main() -> int:
         sys.stderr = open(  # noqa: SIM115 — must outlive main()
             os.devnull, "w", encoding="utf-8"
         )
+
+    parser = make_parser()
+    args = parser.parse_args()
+
+    if args.headless:
+        # Headless mode - run cleanup without GUI
+        if not args.repo:
+            parser.error("--repo is required in headless mode")
+        if shutil.which("gh") is None:
+            print(
+                "Error: the `gh` CLI was not found on PATH. "
+                "Install it from https://cli.github.com/ and run `gh auth login`.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Import here to avoid Qt dependency in headless mode
+        from typing import Any
+
+        from PySide6.QtCore import QCoreApplication, Signal
+
+        from .worker import CleanupWorker, check_gh_auth, check_gh_version
+
+        # Quick auth check
+        auth_error = check_gh_auth()
+        if auth_error:
+            print(f"Error: {auth_error}", file=sys.stderr)
+            return 1
+
+        version_warning = check_gh_version()
+        if version_warning:
+            print(f"Warning: {version_warning}", file=sys.stderr)
+
+        # Set up a minimal Qt application for signals
+        app = QCoreApplication([])
+
+        # Create a log signal handler
+        def log_handler(msg: str) -> None:
+            # Strip HTML tags for console output
+            import re
+
+            clean = re.sub(r"<[^>]+>", "", msg)
+            print(clean)
+
+        log_signal: Any = Signal(str)
+        log_signal.connect(log_handler)
+
+        worker = CleanupWorker(
+            repo=args.repo,
+            keep=args.keep,
+            dry_run=args.dry_run,
+            failed_only=args.failed_only,
+            fetch_limit=args.fetch_limit,
+            max_deletions=args.max_deletions,
+            workflow=args.workflow,
+            concurrency=args.concurrency,
+            older_than_days=args.older_than_days,
+        )
+
+        # Connect signals
+        worker.log_signal.connect(log_signal.emit)
+
+        def on_finished(result: int, kept: int, deleted: int, failed: int) -> None:
+            if result == 0:
+                print(f"Cleanup completed: deleted {deleted} run(s), keeping {kept}.")
+            elif result == 2:
+                print(f"Cleanup cancelled: {deleted} run(s) processed.")
+            else:
+                print(f"Cleanup failed: {failed} failure(s).", file=sys.stderr)
+            app.quit()
+
+        worker.completion_signal.connect(on_finished)
+        worker.start()
+        return app.exec()
+
     try:
-        make_parser().parse_args()
+        parser.parse_args()
     except OSError:
         return 0
 

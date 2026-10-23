@@ -73,9 +73,11 @@ Add/Remove handlers; repopulation blocks signals so typed input survives.
 list-form arguments (no `shell=True`) and timeouts:
 - `gh auth status` (preflight, `GH_AUTH_TIMEOUT`)
 - `gh run list --repo <repo> --limit <N>`
-  `--json databaseId,headSha,createdAt,conclusion` (`GH_LIST_TIMEOUT`;
-  `N` = "Runs to fetch", default 1000, `gh` paginates internally)
-- `gh run delete <run_id> --repo <repo>` (one per run, `GH_DELETE_TIMEOUT`)
+  `--json databaseId,headSha,createdAt,conclusion` (`GH_LIST_TIMEOUT`; `N` =
+  "Runs to fetch", default 1000, `gh` paginates internally)
+- `gh api repos/{RELEASE_REPO}/releases/latest` (optional auto-update check,
+  `GH_RELEASE_TIMEOUT`)
+- `gh run delete <run_id> --repo <repo>` (batch delete via multiple IDs, `GH_DELETE_TIMEOUT`)
 
 `subprocess.CalledProcessError`, `OSError`, and `ValueError`/`TypeError` from
 parsing are caught and surfaced in the log; the app never crashes on `gh`
@@ -94,7 +96,8 @@ Actions-Cleaner/
 ├── AGENTS.md                # this file
 ├── README.md
 ├── TODO.md
-├── actions_cleaner_gui.py   # the app (single file)
+├── actions_cleaner_gui.py   # legacy single-file entry point (deprecated)
+├── app/                      # modular package (current)
 ├── scripts/
 │   ├── build.py             # Nuitka standalone build entrypoint
 │   └── clean.py             # remove build artifacts / caches

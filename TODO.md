@@ -33,10 +33,10 @@ Remaining work items. Everything from the original audit is implemented and veri
 ### Performance & Optimization
 
 - [x] **Batch `gh run delete` calls** — `gh run delete` supports multiple run IDs in one call (`gh run delete <id1> <id2> ...`). Implement batch deletion to reduce subprocess overhead
-- [ ] **Add async/await alternative** — Consider `QThreadPool` + `QRunnable` for better Qt integration vs `ThreadPoolExecutor`
+- [x] **Add async/await alternative** — `QThreadPool` + `QRunnable` implementation in `worker.py:CleanupTask` and `CleanupRunner`
 - [x] **Cache `gh auth status`** — Avoid repeated auth checks within a single session (currently checked once per run)
-- [ ] **Optimize log widget** — Use `QPlainTextEdit.appendPlainText` efficiently; consider `QTextEdit` with HTML for colored output (errors red, success green)
-- [ ] **Lazy-load heavy imports** — Move `ThreadPoolExecutor` import inside parallel path (already done); audit other imports
+- [x] **Optimize log widget** — `QTextEdit` with HTML for colored output (errors red, success green, warnings yellow, info blue, dry-run orange)
+- [x] **Lazy-load heavy imports** — Move `ThreadPoolExecutor` import inside parallel path (already done); audit other imports
 
 ### Features & UX
 
@@ -44,12 +44,12 @@ Remaining work items. Everything from the original audit is implemented and veri
 - [x] **Multi-repo cleanup** — Add "Clean All Saved Repos" button that iterates saved repos sequentially
 - [x] **Export/Import settings** — JSON export/import for repos + preferences (backup/restore)
 - [x] **Keyboard shortcuts** — `Ctrl+Enter` to start cleanup, `Esc` to cancel, `Space` to pause/resume
-- [ ] **System tray integration** — Minimize to tray, run cleanup in background, notify on completion
+- [x] **System tray integration** — Minimize to tray, run cleanup in background, notify on completion
 - [x] **Dark mode support** — Respect system theme or add manual toggle (PySide6 `QApplication.setStyle`)
-- [ ] **Progress persistence** — Save progress on cancel/pause; resume from checkpoint on re-run
+- [x] **Progress persistence** — Save progress on cancel/pause; resume from checkpoint on re-run (checkpoint in `~/.actions-cleaner-checkpoint.json`)
 - [x] **Filter by date range** — Add "Older than N days" filter alongside commit-based retention
 - [x] **Filter by workflow conclusion** — Multi-select: success, failure, cancelled, skipped, timed_out, startup_failure
-- [ ] **Show run details on hover** — Tooltip with run URL, conclusion, timestamp when hovering log entries
+- [x] **Show run details on hover** — Tooltip with run URL, conclusion, timestamp when hovering log entries (HTML title attribute on run links)
 - [x] **Auto-detect `gh` path** — Check common install locations (`/usr/local/bin`, `%LOCALAPPDATA%\GitHub CLI`, etc.) if not on PATH
 
 ### Error Handling & Robustness
@@ -58,7 +58,7 @@ Remaining work items. Everything from the original audit is implemented and veri
 - [x] **Retry transient failures** — Exponential backoff (3 retries, 1s base, 30s max) for network errors, 5xx, rate limits (in `gh_retry.py`)
 - [x] **Validate `gh` version** — Warn if `gh` is too old (< 2.0) or missing required subcommands (in `worker.py:check_gh_version()`)
 - [x] **Better error messages** — Map common `gh` error codes to actionable guidance (e.g., "run not found" → "may have been already deleted")
-- [ ] **Graceful degradation** — If `gh` output format changes, log raw output and continue instead of crashing
+- [x] **Graceful degradation** — If `gh` output format changes, log raw output and continue instead of crashing (in `selection.py:list_runs`)
 
 ### Build & Distribution
 
@@ -66,20 +66,20 @@ Remaining work items. Everything from the original audit is implemented and veri
 - [ ] **Add macOS DMG** — `create-dmg` for notarized app bundle
 - [ ] **Add Linux AppImage/Flatpak** — `appimage-builder` or `flatpak-builder` configs
 - [ ] **Sign binaries** — Code signing for Windows/macOS (requires certificates)
-- [ ] **Auto-update check** — Optional GitHub Releases poll on startup (opt-in, respects dry-run default)
+- [x] **Auto-update check** — Optional GitHub Releases poll on startup (opt-in, respects dry-run default; `UpdateCheckTask` + `UpdateCheckSignals`)
 
 ### Documentation
 
 - [ ] **Add README screenshots** — Annotated UI screenshots for each feature
-- [ ] **Add CLI docs** — Document `--version`, future headless mode
+- [x] **Add CLI docs** — Document `--version`, `--headless` mode and all options
 - [x] **Add CONTRIBUTING.md** — Dev setup, test commands, PR guidelines
 - [x] **Add CHANGELOG.md** — Keep a changelog (automated from conventional commits?)
 
 ### CI/CD
 
-- [ ] **Add dependabot/renovate** — Auto-update Python deps and `gh` CLI in CI
+- [x] **Add dependabot/renovate** — Auto-update Python deps and `gh` CLI in CI (`.github/dependabot.yml`)
 - [ ] **Add release automation** — `release.yml` already exists; verify it creates signed artifacts
-- [ ] **Add benchmark job** — Track `gh run list`/`delete` latency over time
+- [x] **Add benchmark job** — Track `gh run list`/`delete` latency over time (in `ci.yml`)
 
 ---
 

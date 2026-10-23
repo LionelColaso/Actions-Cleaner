@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from collections.abc import Collection
 from typing import Any, cast
 
 from .repo import is_valid_repo
@@ -46,6 +46,8 @@ TIMEOUT_MAX = 180
 TIMEOUT_LIST_DEFAULT = 60
 TIMEOUT_DELETE_DEFAULT = 30
 TIMEOUT_AUTH_DEFAULT = 15
+#: Whether to check GitHub Releases for a newer version on startup (opt-in).
+AUTO_UPDATE_DEFAULT = False
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -89,9 +91,22 @@ def save_repos(repos: list[str]) -> bool:
         return False
 
 
-def load_preferences() -> tuple[int, bool, int, int, str, int, int, int, int, bool]:
+def load_preferences() -> tuple[
+    int,
+    bool,
+    int,
+    int,
+    str,
+    int,
+    int,
+    int,
+    int,
+    bool,
+    bool,
+]:
     """Return ``(keep, failed_only, fetch_limit, max_deletions, last_repo,
-    concurrency, list_timeout, delete_timeout, auth_timeout, dark_mode)``."""
+    concurrency, list_timeout, delete_timeout, auth_timeout, dark_mode,
+    auto_update)``."""
     keep = 2
     failed_only = False
     fetch_limit = FETCH_LIMIT_DEFAULT
@@ -102,6 +117,7 @@ def load_preferences() -> tuple[int, bool, int, int, str, int, int, int, int, bo
     delete_timeout = TIMEOUT_DELETE_DEFAULT
     auth_timeout = TIMEOUT_AUTH_DEFAULT
     dark_mode = False
+    auto_update = AUTO_UPDATE_DEFAULT
     try:
         with open(PREFERENCES_PATH, encoding="utf-8") as f:
             data: Any = json.load(f)
@@ -117,6 +133,7 @@ def load_preferences() -> tuple[int, bool, int, int, str, int, int, int, int, bo
             delete_timeout,
             auth_timeout,
             dark_mode,
+            AUTO_UPDATE_DEFAULT,
         )
     obj = _as_dict(data)
     raw_keep = obj.get("keep")
@@ -177,6 +194,9 @@ def load_preferences() -> tuple[int, bool, int, int, str, int, int, int, int, bo
     raw_dark_mode = obj.get("dark_mode")
     if isinstance(raw_dark_mode, bool):
         dark_mode = raw_dark_mode
+    raw_auto_update = obj.get("auto_update")
+    if isinstance(raw_auto_update, bool):
+        auto_update = raw_auto_update
     return (
         keep,
         failed_only,
@@ -188,6 +208,7 @@ def load_preferences() -> tuple[int, bool, int, int, str, int, int, int, int, bo
         delete_timeout,
         auth_timeout,
         dark_mode,
+        auto_update,
     )
 
 
@@ -202,6 +223,7 @@ def save_preferences(
     delete_timeout: int = TIMEOUT_DELETE_DEFAULT,
     auth_timeout: int = TIMEOUT_AUTH_DEFAULT,
     dark_mode: bool = False,
+    auto_update: bool = AUTO_UPDATE_DEFAULT,
 ) -> bool:
     """Persist preferences (never dry-run)."""
     try:
@@ -218,6 +240,7 @@ def save_preferences(
                     "delete_timeout": delete_timeout,
                     "auth_timeout": auth_timeout,
                     "dark_mode": dark_mode,
+                    "auto_update": auto_update,
                 },
                 f,
                 indent=2,
@@ -241,6 +264,7 @@ def export_settings(path: str) -> bool:
         delete_timeout,
         auth_timeout,
         dark_mode,
+        auto_update,
     ) = load_preferences()
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -259,6 +283,7 @@ def export_settings(path: str) -> bool:
                         "delete_timeout": delete_timeout,
                         "auth_timeout": auth_timeout,
                         "dark_mode": dark_mode,
+                        "auto_update": auto_update,
                     },
                 },
                 f,
@@ -271,7 +296,22 @@ def export_settings(path: str) -> bool:
 
 def import_settings(
     path: str,
-) -> tuple[list[str], tuple[int, bool, int, int, str, int, int, int, int, bool]] | None:
+) -> tuple[
+    list[str],
+    tuple[
+        int,
+        bool,
+        int,
+        int,
+        str,
+        int,
+        int,
+        int,
+        int,
+        bool,
+        bool,
+    ],
+] | None:
     """Import repositories and preferences from a JSON file.
 
     Returns tuple of (repos, preferences) or None on failure.
@@ -305,6 +345,7 @@ def import_settings(
     delete_timeout = TIMEOUT_DELETE_DEFAULT
     auth_timeout = TIMEOUT_AUTH_DEFAULT
     dark_mode = False
+    auto_update = AUTO_UPDATE_DEFAULT
     raw_keep = prefs_obj.get("keep")
     if (
         isinstance(raw_keep, int)
@@ -363,6 +404,9 @@ def import_settings(
     raw_dark_mode = prefs_obj.get("dark_mode")
     if isinstance(raw_dark_mode, bool):
         dark_mode = raw_dark_mode
+    raw_auto_update = prefs_obj.get("auto_update")
+    if isinstance(raw_auto_update, bool):
+        auto_update = raw_auto_update
     return (
         repos,
         (
@@ -376,6 +420,7 @@ def import_settings(
             delete_timeout,
             auth_timeout,
             dark_mode,
+            auto_update,
         ),
     )
 
@@ -391,7 +436,7 @@ def save_checkpoint(
     dry_run: bool,
     failed_only: bool,
     workflow: str,
-    conclusions: set[str],
+    conclusions: Collection[str],
     older_than_days: int,
     delete_ids: list[str],
     done: int,

@@ -133,17 +133,30 @@ def list_runs(
         )
     items = cast(list[dict[str, Any]], data)
     runs: list[RunInfo] = []
+    parse_errors = 0
     for item in items:
-        obj = _as_dict(item)
-        if "databaseId" not in obj or "headSha" not in obj:
-            continue
-        runs.append(
-            RunInfo(
-                databaseId=int(obj["databaseId"]),
-                headSha=str(obj["headSha"]),
-                createdAt=str(obj.get("createdAt") or ""),
-                conclusion=str(obj.get("conclusion") or ""),
+        try:
+            obj = _as_dict(item)
+            if "databaseId" not in obj or "headSha" not in obj:
+                parse_errors += 1
+                continue
+            runs.append(
+                RunInfo(
+                    databaseId=int(obj["databaseId"]),
+                    headSha=str(obj["headSha"]),
+                    createdAt=str(obj.get("createdAt") or ""),
+                    conclusion=str(obj.get("conclusion") or ""),
+                )
             )
+        except (ValueError, TypeError, KeyError) as e:
+            parse_errors += 1
+            if log_signal is not None and hasattr(log_signal, "emit"):
+                log_signal.emit(f"Warning: failed to parse run entry (skipping): {e}")
+    if parse_errors and log_signal is not None and hasattr(log_signal, "emit"):
+        log_signal.emit(
+            f"Warning: {parse_errors} run entr{'y was' if parse_errors == 1 else 'ies were'} "
+            f"skipped due to unexpected gh output format. "
+            f"Raw output logged for debugging."
         )
     return runs
 

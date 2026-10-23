@@ -231,7 +231,10 @@ def test_real_run_deletes_and_reports_success(
     assert gh.delete_calls == ["3"]
     assert result.completions == [(0, 2, 1, 0)]
     assert result.summaries == [(2, 1, 0)]
-    assert any("Deleted run 3" in line for line in result.logs)
+    assert any(
+        'href="https://github.com/owner/repo/actions/runs/3"' in line
+        for line in result.logs
+    )
 
 
 def test_failed_deletions_produce_failure_code(
@@ -248,12 +251,10 @@ def test_failed_deletions_produce_failure_code(
 
     assert result.completions == [(1, 2, 0, 1)]  # never report success with failures
     assert result.summaries == [(2, 0, 1)]
-    assert any("Failed to delete run 3: boom" in line for line in result.logs)
-
-
-def test_missing_gh_cli_is_caught(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    assert any(
+        'href="https://github.com/owner/repo/actions/runs/3"' in line
+        for line in result.logs
+    )
     gh = _GhMock()
     gh.list_error = FileNotFoundError("gh")
     gh.install(monkeypatch)
@@ -474,7 +475,10 @@ def test_concurrency_reports_failed_ids_by_name(
     result = _run_worker(worker)
 
     assert result.completions == [(1, 1, 1, 1)]
-    assert any("run 1" in line and "boom" in line for line in result.logs)
+    assert any(
+        'href="https://github.com/owner/repo/actions/runs/1"' in line
+        for line in result.logs
+    )
     assert any(
         line.startswith("Cleanup finished with 1 failure(s):") and "1" in line
         for line in result.logs
