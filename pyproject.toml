@@ -19,7 +19,7 @@ dev = [
   "tzdata>=2026.5",
 ]
 
-build = ["nuitka>=2.0"]
+build = ["nuitka>=4.3.1"]
 
 [build-system]
 requires = ["hatchling"]
