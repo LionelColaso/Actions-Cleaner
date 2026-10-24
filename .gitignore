@@ -39,8 +39,11 @@ ENV/
 .vscode/*
 !.vscode/launch.json
 !.vscode/settings.json
-.ropeproject/
+
+# Ide plugins , mcp-servers and extras
 .kilo/
+.ropeproject/
+.serena/
 
 # Nuitka / build
 *.build/
@@ -49,9 +52,6 @@ ENV/
 nuitka-crash-report.xml
 build_err.log
 build_local.log
-
-# CocoIndex Code (ccc)
-.cocoindex_code/
 
 # Dictionaries
 ltex.dictionary*
